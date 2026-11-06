@@ -1,0 +1,2074 @@
+#pragma once
+#include <juce_gui_basics/juce_gui_basics.h>
+#include <juce_dsp/juce_dsp.h>
+#include "PluginProcessor.h"
+#include "Theme.h"
+#include "Lessons.h"
+#include "Presets.h"
+
+// Small helpers shared by the editor's parts
+struct ParamHelp
+{
+    explicit ParamHelp (EQAnatomyProcessor& p) : proc (p) {}
+    EQAnatomyProcessor& proc;
+    juce::RangedAudioParameter* get (const juce::String& id) const { return proc.apvts.getParameter (id); }
+    float value (const juce::String& id) const { return proc.apvts.getRawParameterValue (id)->load(); }
+    void set (const juce::String& id, float v) const { if (auto* p = get (id)) p->setValueNotifyingHost (p->convertTo0to1 (v)); }
+    void begin (const juce::String& id) const { if (auto* p = get (id)) p->beginChangeGesture(); }
+    void end (const juce::String& id) const { if (auto* p = get (id)) p->endChangeGesture(); }
+    void setGesture (const juce::String& id, float v) const { begin (id); set (id, v); end (id); }
+    // Option(Alt)+click: back to the default value, one gesture = one undo step
+    static bool altDown() { return juce::ModifierKeys::currentModifiers.isAltDown(); }
+    bool resetDefault (const juce::String& id) const
+    {
+        auto* p = get (id); if (p == nullptr) return false;
+        proc.undo.beginNewTransaction();
+        p->beginChangeGesture(); p->setValueNotifyingHost (p->getDefaultValue()); p->endChangeGesture();
+        return true;
+    }
+    void toggleGesture (const juce::String& id) const { if (altDown()) resetDefault (id); else setGesture (id, value (id) > 0.5f ? 0.0f : 1.0f); }
+    bool ja() const { return proc.uiState.getProperty ("lang", "ja").toString() == "ja"; }
+    juce::String tr (const char* j, const char* e) const { return juce::String::fromUTF8 (ja() ? j : e); }
+    int selected() const { return juce::jlimit (0, 5, (int) proc.uiState.getProperty ("selected", 2)); }
+    void select (int i) const { proc.uiState.setProperty ("selected", i, nullptr); }
+    // hover help, filled by the editor from the component under the mouse
+    juce::String hoverTitle, hoverText;
+};
+
+// Short help shown in the info card when the mouse is over a control (Learn off)
+inline void setHelp (juce::Component& c, const char* title, const char* ja, const char* en)
+{
+    auto& p = c.getProperties();
+    p.set ("helpT", juce::String::fromUTF8 (title)); p.set ("helpJ", juce::String::fromUTF8 (ja)); p.set ("helpE", juce::String::fromUTF8 (en));
+}
+// ComboBox that jumps to the default on Option+click instead of opening its menu
+struct ResetCombo : public juce::ComboBox
+{
+    std::function<void()> onAlt;
+    void mouseDown (const juce::MouseEvent& e) override { skip = e.mods.isAltDown() && onAlt && ! e.mods.isPopupMenu(); if (skip) onAlt(); else juce::ComboBox::mouseDown (e); }
+    void mouseUp (const juce::MouseEvent& e) override { if (skip) { skip = false; return; } juce::ComboBox::mouseUp (e); }
+    void mouseDrag (const juce::MouseEvent& e) override { if (! skip) juce::ComboBox::mouseDrag (e); }
+private:
+    bool skip = false;
+};
+inline void markReset (juce::Component& c) { c.getProperties().set ("resettable", true); }
+
+inline const char* mouseHelpJa() { return "点をドラッグ：周波数とゲイン／Cmd＋ドラッグ：縦か横に固定／Alt＋ドラッグ：そのバンドだけを試聴／幅ハンドル・Shift＋上下・ホイール：Q／ダブルクリック：追加・オフ／右クリック：浮き窓の表示切替／上部の SAT タブ：サチュレーターの帯域／Cmd＋Z：元に戻す"; }
+inline const char* mouseHelpEn() { return "Drag a dot: frequency and gain / Cmd + drag: lock to one axis / Alt + drag: solo that band / width handles, Shift + drag or wheel: Q / double-click: add or switch off / right-click: show or hide the floating panel / SAT tabs: saturator band / Cmd + Z: undo"; }
+
+inline juce::String fmtHz (double f)
+{
+    if (f >= 1000) return juce::String (f / 1000.0, f >= 10000 ? 1 : 2) + "k";
+    return juce::String ((int) std::round (f));
+}
+inline juce::String fmtDb (double g, int d = 1)
+{
+    const double r = std::round (g * std::pow (10, d)) / std::pow (10, d);
+    return (r > 0 ? "+" : r < 0 ? juce::String::fromUTF8 ("\xe2\x88\x92") : "") + juce::String (std::abs (r), d);
+}
+
+// =============================================================================
+//  DragValue: drag up / down (Shift = fine), wheel, double-click to type
+// =============================================================================
+class DragValue : public juce::Component
+{
+public:
+    DragValue (ParamHelp& h, juce::String captionText) : ph (h), caption (std::move (captionText)) { setOpaque (false); markReset (*this); }
+    std::function<juce::String (float)> format = [] (float v) { return juce::String (v, 2); };
+    std::function<float (const juce::String&)> parse = [] (const juce::String& s) { return s.getFloatValue(); };
+    juce::Colour valueColour = theme::text;
+    bool compact = false;                       // caption beside the value instead of under it
+    void setParam (const juce::String& id) { if (id != paramID) { paramID = id; repaint(); } }
+    void setCaption (const juce::String& c) { if (c != caption) { caption = c; repaint(); } }
+    bool isBusy() const { return dragging || editor != nullptr; }
+
+    void paint (juce::Graphics& g) override
+    {
+        auto r = getLocalBounds().toFloat().reduced (0.5f);
+        g.setColour (theme::hilite (over || dragging ? 0.25f : 0.1f));
+        g.fillRoundedRectangle (r, 4.0f);
+        if (editor != nullptr) return;
+        const float v = ph.value (paramID);
+        if (compact)
+        {
+            g.setColour (theme::muted); g.setFont (theme::ui (9.5f));
+            g.drawText (caption, 6, 0, getWidth() - 12, 14, juce::Justification::centredLeft);
+            g.setColour (valueColour); g.setFont (theme::mono (12.5f, true));
+            g.drawText (format (v), 6, 12, getWidth() - 12, getHeight() - 14, juce::Justification::centredLeft);
+        }
+        else
+        {
+            g.setColour (valueColour); g.setFont (theme::mono (15.0f, true));
+            g.drawText (format (v), 0, 0, getWidth(), getHeight() - 14, juce::Justification::centred);
+            g.setColour (theme::muted); g.setFont (theme::ui (9.5f));
+            g.drawText (caption, 0, getHeight() - 15, getWidth(), 14, juce::Justification::centred);
+        }
+    }
+    void mouseEnter (const juce::MouseEvent&) override { over = true; repaint(); }
+    void mouseExit (const juce::MouseEvent&) override { over = false; repaint(); }
+    std::function<void()> onRightClick;
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu()) { if (onRightClick) onRightClick(); return; }
+        if (e.mods.isAltDown() && ph.resetDefault (paramID)) { repaint(); return; }      // Option+click: default (no drag)
+        if (auto* p = ph.get (paramID)) { start = p->getValue(); lastY = e.getScreenPosition().toFloat().y; p->beginChangeGesture(); dragging = true; }
+        setMouseCursor (juce::MouseCursor::UpDownResizeCursor);
+    }
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        auto* p = ph.get (paramID); if (p == nullptr || ! dragging) return;
+        const float sens = e.mods.isShiftDown() ? 0.0008f : 0.005f;      // 200 px = full range, Shift ×1/6
+        // screen coordinates: the popup follows the node, so local positions would feed back
+        const float y = e.getScreenPosition().toFloat().y;
+        start = juce::jlimit (0.0f, 1.0f, start + (lastY - y) * sens); lastY = y;
+        p->setValueNotifyingHost (start); repaint();
+    }
+    void mouseUp (const juce::MouseEvent&) override
+    {
+        if (! dragging) return;
+        if (auto* p = ph.get (paramID)) p->endChangeGesture();
+        dragging = false; setMouseCursor (juce::MouseCursor::NormalCursor); repaint();
+    }
+    void mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w) override
+    {
+        auto* p = ph.get (paramID); if (p == nullptr || w.isInertial || std::abs (w.deltaY) < 0.01f) return;
+        const float step = (e.mods.isShiftDown() ? 0.002f : 0.01f) * (w.deltaY > 0 ? 1.0f : -1.0f) * (w.isReversed ? -1.0f : 1.0f);
+        p->beginChangeGesture(); p->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, p->getValue() + step)); p->endChangeGesture(); repaint();
+    }
+    void mouseDoubleClick (const juce::MouseEvent&) override
+    {
+        editor = std::make_unique<juce::TextEditor>();
+        editor->setFont (theme::mono (13.0f, true)); editor->setJustification (juce::Justification::centred);
+        editor->setText (format (ph.value (paramID)).trim(), false); editor->selectAll();
+        editor->setBounds (getLocalBounds().withTrimmedBottom (compact ? 0 : 14));
+        editor->onReturnKey = [this] { commit (true); };
+        editor->onEscapeKey = [this] { commit (false); };
+        editor->onFocusLost = [this] { commit (true); };
+        addAndMakeVisible (*editor); editor->grabKeyboardFocus();
+    }
+
+private:
+    void commit (bool apply)
+    {
+        if (editor == nullptr) return;
+        const auto txt = editor->getText();
+        juce::MessageManager::callAsync ([sp = juce::Component::SafePointer<DragValue> (this)] { if (sp != nullptr) { sp->editor.reset(); sp->repaint(); } });
+        if (apply && txt.trim().isNotEmpty())
+            if (auto* p = ph.get (paramID))
+                ph.setGesture (paramID, p->getNormalisableRange().getRange().clipValue (parse (txt.replace (juce::String::fromUTF8 ("\xe2\x88\x92"), "-"))));
+    }
+    ParamHelp& ph; juce::String paramID, caption;
+    float start = 0, lastY = 0; bool over = false, dragging = false;
+    std::unique_ptr<juce::TextEditor> editor;
+};
+
+inline float parseHz (const juce::String& s) { auto t = s.trim(); float v = t.getFloatValue(); if (t.containsIgnoreCase ("k")) v *= 1000.0f; return v; }
+
+// =============================================================================
+//  Seg: a small segmented switch bound to a choice parameter
+// =============================================================================
+class Seg : public juce::Component
+{
+public:
+    Seg (ParamHelp& h, juce::StringArray labels) : ph (h), items (std::move (labels)) { markReset (*this); }
+    void setParam (const juce::String& id) { paramID = id; repaint(); }
+    juce::Colour onColour = theme::accent;
+    std::function<bool()> enabled = [] { return true; };
+    std::function<bool (int)> itemOn = [] (int) { return true; };       // dims single items (still clickable)
+    void paint (juce::Graphics& g) override
+    {
+        auto r = getLocalBounds().toFloat();
+        g.setColour (theme::shade (0.33f)); g.fillRoundedRectangle (r, 4.0f);
+        const int sel = paramID.isEmpty() ? 0 : (int) ph.value (paramID);
+        const float w = r.getWidth() / (float) items.size();
+        for (int i = 0; i < items.size(); ++i)
+        {
+            const bool en = enabled() && itemOn (i);
+            auto c = juce::Rectangle<float> (r.getX() + i * w, r.getY(), w, r.getHeight()).reduced (2.0f);
+            if (i == sel) { g.setColour (onColour.withAlpha (en ? 1.0f : 0.4f)); g.fillRoundedRectangle (c, 3.0f); }
+            g.setColour (i == sel ? theme::onAccent : (en ? theme::muted : theme::faint));
+            g.setFont (theme::ui (10.0f, i == sel));
+            g.drawText (items[i], c, juce::Justification::centred);
+        }
+    }
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (paramID.isEmpty() || e.mods.isPopupMenu()) return;
+        if (e.mods.isAltDown() && ph.resetDefault (paramID)) { repaint(); return; }
+        const int i = juce::jlimit (0, items.size() - 1, (int) (e.x * items.size() / std::max (1, getWidth())));
+        ph.proc.undo.beginNewTransaction();
+        ph.setGesture (paramID, (float) i); repaint();
+    }
+private:
+    ParamHelp& ph; juce::StringArray items; juce::String paramID;
+};
+
+// =============================================================================
+//  Floating band editor. Translucent (no blur, so it costs nothing).
+//    row 1  ● B3  type  slope  🎧
+//    row 2  FREQ  GAIN  Q
+//    row 3  PHASE Min|Lin   CH St|M|S
+//    row 4  DYN  In|SC  THR  ABOVE  BELOW  meter
+//    row 5  TRANSIENT ─────●───── BODY
+// =============================================================================
+class BandPopup : public juce::Component
+{
+public:
+    explicit BandPopup (ParamHelp& h)
+        : ph (h), fq (h, "FREQ Hz"), gn (h, "GAIN dB"), qv (h, "Q"), th (h, "THR"), rg (h, "ABOVE"), bl (h, "BELOW"),
+          at (h, "ATT ms"), rl (h, "REL ms"), kn (h, "KNEE dB"), sn (h, "SENS dB"), wd (h, "WIDTH dB"), ta (h, "ATK ms"),
+          phaseSeg (h, { "Min", "Lin" }), chSeg (h, { "St", "M", "S" }), srcSeg (h, { "In", "SC", "M", "S" })
+    {
+        setOpaque (false);
+        for (auto* d : { &fq, &gn, &qv, &th, &rg, &bl, &at, &rl, &kn, &sn, &wd, &ta }) d->onRightClick = [this] { hidePanel(); };
+        dynBtn.setButtonText ("DYN");
+        dynBtn.onClick = [this] { ph.toggleGesture (pid::band (band, "dyn")); }; markReset (dynBtn);
+        soloBtn.setButtonText ("SOLO"); soloBtn.setClickingTogglesState (false);
+        soloBtn.onClick = [this] { ph.proc.soloBand = ph.proc.soloBand.load() == band ? -1 : band; };
+        soloBtn.setColour (juce::TextButton::buttonOnColourId, theme::pre);   // refreshed in refresh()
+        for (auto* c : { (juce::Component*) &dynBtn, (juce::Component*) &soloBtn }) addAndMakeVisible (c);
+        th.format = [] (float v) { return fmtDb (v, 0); };
+        rg.format = [] (float v) { return fmtDb (v); };
+        bl.format = [] (float v) { return fmtDb (v); };
+        auto num = [] (float v) { return v == std::round (v) ? juce::String ((int) v) : juce::String (v, 1); };
+        at.format = [] (float v) { return juce::String (v, v < 10.0f ? 1 : 0); };
+        rl.format = [] (float v) { return juce::String ((int) std::round (v)); };
+        kn.format = num; sn.format = [] (float v) { return fmtDb (v); }; wd.format = num;
+        at.setParam (pid::band (0, "att")); sn.setParam (pid::tbSens); wd.setParam (pid::tbWidth); ta.setParam (pid::tbAtt); ta.format = [] (float v) { return juce::String (v, 2); };    // at: band set in refresh()
+        for (auto* d : { &th, &rg, &bl, &at, &rl, &kn, &sn, &wd, &ta }) { d->compact = true; addAndMakeVisible (*d); }
+        for (auto* s : { &phaseSeg, &chSeg, &srcSeg }) addAndMakeVisible (*s);
+        srcSeg.itemOn = [this] (int i) { return i != 1 || ph.proc.sidechainConnected(); };   // SC needs the host's sidechain; Mid / Side always work
+        tb.setSliderStyle (juce::Slider::LinearHorizontal); tb.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+        tb.setRange (-100.0, 100.0, 1.0); tb.setDoubleClickReturnValue (true, 0.0); markReset (tb);
+        tb.onDragStart = [this] { tbDrag = true; ph.proc.undo.beginNewTransaction(); ph.begin (pid::band (band, "tb")); };
+        tb.onDragEnd = [this] { tbDrag = false; ph.end (pid::band (band, "tb")); };
+        tb.onValueChange = [this]
+        {
+            if (refreshing) return;
+            if (tbDrag) ph.set (pid::band (band, "tb"), (float) tb.getValue());      // left (−) = Transient only, right (+) = Body only
+            else { ph.proc.undo.beginNewTransaction(); ph.setGesture (pid::band (band, "tb"), (float) tb.getValue()); }   // Option+click / double-click / wheel
+        };
+        addAndMakeVisible (tb);
+
+        setHelp (*this, "BAND", "左の色の丸でバンドのオン・オフ（塗り＝オン、輪＝オフ）。右クリックで浮き窓を隠す", "The coloured dot switches the band (filled = on, ring = off). Right-click hides the panel");
+        setHelp (type, "TYPE", "フィルターの種類。Bell・Shelf・Cut・Notch・All-pass", "Filter type: bell, shelf, cut, notch or all-pass");
+        setHelp (slope, "SLOPE", "カットの傾き。6 dB/oct 増えるごとに位相が 90° 多く回る", "Cut slope. Each extra 6 dB/oct turns the phase another 90°");
+        setHelp (fq, "FREQ", "中心（またはカットオフ）周波数。上下ドラッグ、Shift で微調整、ダブルクリックで入力（2.5k など）", "Centre or cutoff frequency. Drag up/down, Shift for fine, double-click to type (e.g. 2.5k)");
+        setHelp (gn, "GAIN", "ブースト・カット量。上下ドラッグ、Shift で微調整、ダブルクリックで入力", "Boost or cut. Drag up/down, Shift for fine, double-click to type");
+        setHelp (qv, "Q", "帯域の幅。大きいほど狭い。Q 1 ≒ 1.4 オクターブ", "Bandwidth: higher is narrower. Q 1 ≈ 1.4 octaves");
+        setHelp (soloBtn, "BAND SOLO", "このバンドの帯域だけを聴く（グラフ上で Alt＋ドラッグ中も）。注意：音量が大きく変わるので、モニターを下げてから",
+                 "Hear only this band's region (also while Alt-dragging in the graph). Careful: the level changes a lot, turn the monitors down first");
+        setHelp (phaseSeg, "PHASE Min / Lin", "Min：最小位相（遅れなし、位相が回る）／Lin：リニア位相（位相は回らないが、プリリンギングが出る）。注意：Lin のバンドが1つでもあると全体が FIR 分遅れる。低域・高い Q・急なカットは Min 推奨",
+                 "Min: minimum phase (no delay, the phase turns) / Lin: linear phase (no phase shift, but pre-ringing). Careful: one Lin band delays everything by the FIR. Keep lows, high Q and steep cuts on Min");
+        setHelp (chSeg, "CH St / M / S", "St：左右両方／M：中央（Mid）だけ／S：左右の差（Side）だけ。注意：Side を持ち上げすぎるとモノラル再生で消える成分が増える。右の CORR が 0 を下回ったら控えめに",
+                 "St: both / M: centre (mid) only / S: the difference (side) only. Careful: big side boosts vanish in mono — back off if CORR on the right drops below 0");
+        setHelp (dynBtn, "DYN", "ダイナミック EQ。この帯域のレベルに合わせてゲインが動く。注意：Min のバンドで、Zero latency の時だけ働く", "Dynamic EQ: the gain follows this band's level. Careful: Min bands in Zero latency only");
+        setHelp (srcSeg, "DETECT In / SC / M / S", "何を聞いて動くか。In：入力（バンドの CH が Side なら Side、それ以外は Mid）／SC：ホストのサイドチェーン入力（例：ボーカルが入った時だけギターの 2〜4 kHz を下げる）／M：入力の Mid／S：入力の Side（例：Side が大きい時だけ効かせる）。M・S はバンドの CH 設定に関係なくその成分を聞く。注意：SC は Ableton ではデバイスのサイドチェーン欄で入力元を指定する。つないでいない間は灰色で、In と同じ動き",
+                 "What the band listens to. In: the input (the Side if the band's CH is Side, otherwise the Mid) / SC: the host's sidechain (e.g. dip guitars at 2–4 kHz only while the vocal sings) / M: the input's Mid / S: the input's Side (e.g. act only when the sides are loud). M and S ignore the band's CH setting. Careful: pick the SC source in the host's sidechain section; it is dimmed and acts like In until connected");
+        setHelp (th, "THR", "しきい値。ここを境に、上なら ABOVE、下なら BELOW の量だけ動く（KNEE の幅だけ離れると全量）。下の検出メーターの白い線をドラッグしても動かせる", "Threshold. Above it ABOVE applies, below it BELOW (full amount one KNEE width away). You can also drag the white line in the meter");
+        setHelp (at, "ATT", "検出器の立ち上がりの速さ（ms、0.5〜200、既定 5）。短いほどアタックにすぐ反応、長いほど短い音を見逃す。注意：短すぎると低域で波形に追従してゲインがひずむ", "How fast the detector rises (ms, 0.5–200, default 5). Short reacts to attacks at once, long lets short hits through. Careful: very short on lows follows the waveform and distorts the gain");
+        setHelp (rl, "REL", "検出器が下がる速さ（ms、5〜2000、既定 120）。長いほどゲインの戻りがゆっくり。注意：短いとポンピング、長いと次の音まで戻らない", "How fast the detector falls (ms, 5–2000, default 120). Long returns the gain slowly. Careful: short pumps, long may not recover before the next hit");
+        setHelp (kn, "KNEE", "しきい値から全量に達するまでの幅（dB、0〜24、既定 12）。0 はしきい値で一気に切り替わる（ハード）、大きいほどなだらか", "Distance from the threshold to the full amount (dB, 0–24, default 12). 0 switches hard at the threshold; larger is gentler");
+        setHelp (ta, "T/B ATTACK", "アタックと判定し始めてからマスクが上がり切るまでの速さ（ms、0.1〜2、既定 2）。小さいほどアタックの頭が Body 側に漏れにくい。下がる速さ（2 ms）は変わらない。全バンド共通。注意：小さすぎるとマスクが波形に反応してざらつくことがある",
+                 "How fast the mask rises once an attack is detected (ms, 0.1–2, default 2). Smaller keeps the front of the attack out of Body. The fall (2 ms) is unchanged. Shared by all bands. Careful: very small values can make the mask follow the waveform and sound grainy");
+        setHelp (sn, "T/B SENS", "Transient / Body の検出器の感度（dB、−12〜+12、既定 0）。＋にするとアタックと判定されやすく、−にすると本当に鋭い所だけがアタックになる。全バンド共通。スペアナの Trans / Body と SOLO T / B にも効く", "Sensitivity of the transient / body detector (dB, −12 to +12, default 0). Plus calls more of the sound attack; minus keeps only sharp hits. Shared by all bands; also affects the analyzer's Trans / Body and SOLO T / B");
+        setHelp (wd, "T/B WIDTH", "アタックとボディの境目の幅（dB、1〜18、既定 6）。小さいと 0 か 1 に切り替わる（ハード）、大きいと中間が増える。全バンド共通", "Width of the transition between body and attack (dB, 1–18, default 6). Small switches hard between 0 and 1; large keeps more in-between. Shared by all bands");
+        setHelp (rg, "ABOVE", "しきい値より大きい時の変化量。マイナス＝出過ぎた時だけ削る／プラス＝大きい時だけ持ち上げる", "Change when above the threshold. Negative: cut when it jumps out / positive: lift when loud");
+        setHelp (bl, "BELOW", "しきい値より小さい時の変化量。プラス＝小さい時だけ持ち上げる（アップワード）／マイナス＝小さい時は下げる（エキスパンダー的）。注意：プラスにすると無音部分のノイズも上がる。−60 dB 以下では反応しない",
+                 "Change when below the threshold. Positive lifts quiet passages (upward) / negative pushes them down (expander-like). Careful: positive also lifts noise; it ignores levels under −60 dB");
+        setHelp (tb, "TRANSIENT / BODY", "EQ の効きをアタックと余韻に配分する。左（TRANSIENT）に寄せるとアタックだけに効き、右（BODY）に寄せると余韻だけに効く。T・B の数字はそれぞれへの効きの割合（％）。ダブルクリックで中央。注意：差を極端にすると音量が揺れ、歪みやポンピングが出る。Min のバンド（Zero latency）だけ",
+                 "Splits the band's effect between attack and body. Left (TRANSIENT): the attack only; right (BODY): the body only. T and B show how much of the effect each gets (%). Double-click centres. Careful: extreme settings wobble the level and can pump. Min bands in Zero latency only");
+
+        type.addItemList (typeNames(), 1);
+        slope.addItemList (slopeNames(), 1);
+        for (auto* c : { &type, &slope })
+        {
+            c->setColour (juce::ComboBox::backgroundColourId, theme::panel.withAlpha (0.33f));
+            c->setColour (juce::ComboBox::outlineColourId, theme::text.withAlpha (0.33f));
+            addAndMakeVisible (*c);
+        }
+        markReset (type); markReset (slope);
+        type.onAlt = [this] { ph.resetDefault (pid::band (band, "type")); };
+        slope.onAlt = [this] { ph.resetDefault (pid::band (band, "slope")); };
+        type.onChange  = [this] { ph.setGesture (pid::band (band, "type"), (float) (type.getSelectedId() - 1)); };
+        slope.onChange = [this] { ph.setGesture (pid::band (band, "slope"), (float) (slope.getSelectedId() - 1)); };
+        fq.format = [] (float v) { return fmtHz (v); };  fq.parse = parseHz;
+        gn.format = [] (float v) { return fmtDb (v); };
+        qv.format = [] (float v) { return juce::String (v, v < 10 ? 2 : 1); };
+        for (auto* d : { &fq, &gn, &qv }) addAndMakeVisible (*d);
+    }
+    void refresh (int b)
+    {
+        refreshing = true;
+        band = b;
+        const int t = (int) ph.value (pid::band (b, "type"));
+        if (type.getSelectedId() != t + 1) type.setSelectedId (t + 1, juce::dontSendNotification);
+        const int s = (int) ph.value (pid::band (b, "slope"));
+        if (slope.getSelectedId() != s + 1) slope.setSelectedId (s + 1, juce::dontSendNotification);
+        const bool cut = t == (int) eqcore::Type::LowCut || t == (int) eqcore::Type::HighCut;
+        const bool noGain = cut || t == (int) eqcore::Type::Notch || t == (int) eqcore::Type::AllPass;
+        slope.setVisible (cut); gn.setVisible (! noGain);
+        fq.setParam (pid::band (b, "freq")); gn.setParam (pid::band (b, "gain")); qv.setParam (pid::band (b, "q"));
+        gn.valueColour = theme::bandColour (b);
+        const bool bandOn = ph.value (pid::band (b, "on")) > 0.5f;
+        for (auto* c : { (juce::Component*) &fq, (juce::Component*) &gn, (juce::Component*) &qv, (juce::Component*) &type, (juce::Component*) &slope })
+            c->setAlpha (bandOn ? 1.0f : 0.45f);
+        phaseSeg.setParam (pid::band (b, "phase")); chSeg.setParam (pid::band (b, "ch")); srcSeg.setParam (pid::band (b, "src"));
+        for (auto* sg : { &phaseSeg, &chSeg, &srcSeg }) sg->onColour = theme::bandColour (b);
+        const bool linForced = ph.proc.currentMode() == eqcore::Mode::Linear;
+        phaseSeg.enabled = [linForced] { return ! linForced; };
+        // dynamics and transient/body: bells and shelves, zero-latency min bands
+        dynType = t == (int) eqcore::Type::Bell || t == (int) eqcore::Type::LowShelf || t == (int) eqcore::Type::HighShelf;
+        const bool avail = ph.proc.dynAvailable (b);
+        const bool dOn = ph.value (pid::band (b, "dyn")) > 0.5f;
+        dynBtn.setToggleState (dOn, juce::dontSendNotification);
+        th.setParam (pid::band (b, "thr")); rg.setParam (pid::band (b, "range")); bl.setParam (pid::band (b, "below"));
+        at.setParam (pid::band (b, "att")); rl.setParam (pid::band (b, "rel")); kn.setParam (pid::band (b, "knee"));
+        for (auto* c : { (juce::Component*) &dynBtn, (juce::Component*) &th, (juce::Component*) &rg, (juce::Component*) &bl, (juce::Component*) &srcSeg,
+                         (juce::Component*) &at, (juce::Component*) &rl, (juce::Component*) &kn })
+        { c->setVisible (dynType); c->setAlpha (dOn && avail ? 1.0f : 0.45f); }
+        for (auto* c : { (juce::Component*) &sn, (juce::Component*) &wd }) { c->setVisible (dynType); c->setAlpha (avail ? 1.0f : 0.45f); }
+        dynBtn.setAlpha (avail ? 1.0f : 0.45f);
+        tb.setAlpha (avail ? 1.0f : 0.4f);
+        tb.setColour (juce::Slider::thumbColourId, theme::bandColour (b));
+        tb.setColour (juce::Slider::trackColourId, theme::bandColour (b).withAlpha (0.4f));
+        if (! tb.isMouseButtonDown()) tb.setValue (ph.value (pid::band (b, "tb")), juce::dontSendNotification);
+        soloBtn.setToggleState (ph.proc.soloBand.load() == b, juce::dontSendNotification);
+        soloBtn.setColour (juce::TextButton::buttonOnColourId, theme::pre);
+        for (auto* c : { &type, &slope })
+        { c->setColour (juce::ComboBox::backgroundColourId, theme::panel.withAlpha (0.33f)); c->setColour (juce::ComboBox::outlineColourId, theme::text.withAlpha (0.33f)); }
+        resized();
+        for (auto* d : { &fq, &gn, &qv, &th, &rg, &bl, &at, &rl, &kn, &sn, &wd }) d->repaint();
+        for (auto* sg : { &phaseSeg, &chSeg, &srcSeg }) sg->repaint();
+        repaint();
+        refreshing = false;
+    }
+    juce::Rectangle<int> dotArea() const { return { 12, 12, 13, 13 }; }
+    void hidePanel() { ph.proc.uiState.setProperty ("popup", false, nullptr); }
+    // the white threshold line in the detector meter can be dragged (±5 px wide hit area, one gesture per drag)
+    float thrX() const
+    {
+        const auto m = meterArea.toFloat();
+        return m.getX() + m.getWidth() * juce::jlimit (0.0f, 1.0f, (ph.value (pid::band (band, "thr")) + 60.0f) / 60.0f);
+    }
+    bool overThr (juce::Point<int> p) const
+    {
+        return dynType && meterArea.expanded (0, 5).contains (p) && std::abs ((float) p.x - thrX()) <= 5.0f;
+    }
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu()) { hidePanel(); return; }
+        if (overThr (e.getPosition()))
+        {
+            if (auto* p = ph.get (pid::band (band, "thr")))
+            { p->beginChangeGesture(); thrDrag = true; thrStartDb = ph.value (pid::band (band, "thr")); thrStartX = e.getScreenPosition().x; repaint(); }
+            return;
+        }
+        if (dotArea().expanded (5).contains (e.getPosition()))
+        {
+            const bool on = ph.value (pid::band (band, "on")) > 0.5f;
+            ph.proc.undo.beginNewTransaction();
+            ph.proc.uiState.setProperty ("keepOff", on ? band : -1, nullptr);
+            if (e.mods.isAltDown()) ph.resetDefault (pid::band (band, "on")); else
+            ph.setGesture (pid::band (band, "on"), on ? 0.0f : 1.0f);
+            repaint();
+        }
+    }
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        if (! thrDrag) return;
+        // screen coordinates, like DragValue: the panel must not feed back into the measurement
+        const float db = juce::jlimit (-60.0f, 0.0f, thrStartDb + (float) (e.getScreenPosition().x - thrStartX) * 60.0f / (float) std::max (1, meterArea.getWidth()));
+        ph.set (pid::band (band, "thr"), db); repaint();
+    }
+    void mouseUp (const juce::MouseEvent&) override
+    {
+        if (! thrDrag) return;
+        ph.end (pid::band (band, "thr")); thrDrag = false; repaint();
+    }
+    void mouseMove (const juce::MouseEvent& e) override
+    {
+        const bool o = dotArea().expanded (5).contains (e.getPosition()), t = overThr (e.getPosition());
+        setMouseCursor (o ? juce::MouseCursor::PointingHandCursor : t ? juce::MouseCursor::LeftRightResizeCursor : juce::MouseCursor::NormalCursor);
+        if (o != dotOver || t != thrOver) { dotOver = o; thrOver = t; repaint(); }
+    }
+    void mouseExit (const juce::MouseEvent&) override { if (dotOver || thrOver) { dotOver = thrOver = false; repaint(); } }
+    bool isBusy() const { return thrDrag || fq.isBusy() || gn.isBusy() || qv.isBusy() || th.isBusy() || rg.isBusy() || bl.isBusy()
+                              || at.isBusy() || rl.isBusy() || kn.isBusy() || sn.isBusy() || wd.isBusy() || tb.isMouseButtonDown(); }
+    int idealHeight() const { return dynType ? 268 : 112; }
+    void paint (juce::Graphics& g) override
+    {
+        auto r = getLocalBounds().toFloat().reduced (0.5f);
+        g.setColour (theme::popup.withAlpha (0.72f)); g.fillRoundedRectangle (r, 8.0f);
+        g.setColour (theme::text.withAlpha (0.18f)); g.drawRoundedRectangle (r, 8.0f, 1.0f);
+        const bool bandOn = ph.value (pid::band (band, "on")) > 0.5f;
+        const auto d = dotArea().toFloat();
+        if (dotOver) { g.setColour (theme::hilite (0.13f)); g.fillEllipse (d.expanded (4.0f)); }
+        g.setColour (theme::bandColour (band));
+        if (bandOn) g.fillEllipse (d); else g.drawEllipse (d.reduced (0.75f), 1.5f);
+        g.setColour (bandOn ? theme::text : theme::muted); g.setFont (theme::ui (12.0f, true));
+        g.drawText ("B" + juce::String (band + 1), 30, 8, 30, 20, juce::Justification::centredLeft);
+        g.setColour (theme::muted); g.setFont (theme::ui (9.5f));
+        g.drawText ("PHASE", 10, rowPhase, 40, 22, juce::Justification::centredLeft);
+        g.drawText ("CH", 152, rowPhase, 24, 22, juce::Justification::centredLeft);
+        if (! dynType) return;
+        g.drawText ("TRANSIENT", 10, rowTB, 60, 20, juce::Justification::centredLeft);
+        g.drawText ("BODY", getWidth() - 46, rowTB, 36, 20, juce::Justification::centredRight);
+        g.setColour (theme::text.withAlpha (0.14f)); g.drawHorizontalLine (rowDet - 5, 10.0f, (float) getWidth() - 10.0f);
+        g.setColour (theme::muted); g.setFont (theme::ui (9.5f));
+        g.drawText ("T/B DETECTOR", 10, rowDet, 80, 30, juce::Justification::centredLeft);
+        g.setColour (theme::faint);
+        g.drawText ("all bands", 272, rowDet, getWidth() - 282, 30, juce::Justification::centredLeft);
+        // detector meter: this band's level vs threshold, and the gain it is applying now
+        auto m = meterArea.toFloat();
+        const bool dOn = ph.value (pid::band (band, "dyn")) > 0.5f, live = dOn && ph.proc.dynAvailable (band);
+        g.setColour (theme::shade (0.4f)); g.fillRoundedRectangle (m, 3.0f);
+        auto xOfDb = [&] (float db) { return m.getX() + m.getWidth() * juce::jlimit (0.0f, 1.0f, (db + 60.0f) / 60.0f); };
+        if (live)
+        {
+            const float lv = ph.proc.detLevelDb[(size_t) band].load();
+            g.setColour (theme::bandColour (band).withAlpha (0.8f));
+            g.fillRoundedRectangle (m.withRight (xOfDb (lv)).reduced (0, 3), 2.0f);
+        }
+        const float tx = xOfDb (ph.value (pid::band (band, "thr")));
+        const bool grab = thrOver || thrDrag;
+        g.setColour (theme::text); g.fillRect (tx - (grab ? 1.5f : 1.0f), m.getY(), grab ? 3.0f : 2.0f, m.getHeight());
+        g.fillRoundedRectangle (tx - 2.5f, m.getY() - 2.0f, 5.0f, 3.0f, 1.0f);                       // a small grip: this line is draggable
+        g.fillRoundedRectangle (tx - 2.5f, m.getBottom() - 1.0f, 5.0f, 3.0f, 1.0f);
+        g.setFont (theme::mono (9.5f));
+        if (! ph.proc.dynAvailable (band))
+        { g.setColour (theme::pre); g.drawText (juce::String ("ZL + Min only"), meterArea.translated (0, 14).withHeight (12), juce::Justification::centredLeft); }
+        else
+        {
+            g.setColour (theme::muted);
+            g.drawText (live ? juce::String ("now ") + fmtDb (ph.proc.dynGainDb[(size_t) band].load()) + " dB" : juce::String ("detector"),
+                        meterArea.translated (0, 14).withHeight (12), juce::Justification::centredLeft);
+        }
+        const float v = ph.value (pid::band (band, "tb"));
+        g.setColour (theme::text); g.setFont (theme::mono (9.5f, true));
+        g.drawText ("T" + juce::String ((int) std::round (v > 0 ? 100 - v : 100)) + " / B" + juce::String ((int) std::round (v < 0 ? 100 + v : 100)),
+                    getWidth() - 110, rowTB - 12, 100, 12, juce::Justification::centredRight);
+    }
+    void resized() override
+    {
+        type.setBounds (64, 8, slope.isVisible() ? 104 : 168, 22);
+        slope.setBounds (172, 8, 72, 22);
+        soloBtn.setBounds (getWidth() - 58, 8, 48, 22);
+        const int w = (getWidth() - 26) / 3, y = 36, h = 40;
+        fq.setBounds (10, y, w, h);
+        if (gn.isVisible()) { gn.setBounds (13 + w, y, w, h); qv.setBounds (16 + 2 * w, y, w, h); }
+        else qv.setBounds (13 + w, y, w, h);
+        rowPhase = 82;
+        phaseSeg.setBounds (52, rowPhase, 90, 22);
+        chSeg.setBounds (176, rowPhase, getWidth() - 186, 22);
+        // DYN: row 4 = on / detector input / level meter; row 5 = the six numbers
+        const int y4 = 112, y5 = 148;
+        dynBtn.setBounds (10, y4 + 2, 40, 24);
+        srcSeg.setBounds (54, y4 + 3, 112, 22);
+        meterArea = { 174, y4 + 2, getWidth() - 184, 14 };
+        const int cw = 46, gap = (getWidth() - 20 - 6 * cw) / 5;
+        DragValue* dv[] = { &th, &rg, &bl, &at, &rl, &kn };
+        for (int k = 0; k < 6; ++k) dv[k]->setBounds (10 + k * (cw + gap), y5, cw, 36);
+        // TRANSIENT / BODY slider, then the detector that feeds it (shared by all bands)
+        rowTB = 204; rowDet = 232;
+        tb.setBounds (70, rowTB, getWidth() - 70 - 50, 20);
+        sn.setBounds (92, rowDet, 56, 30); wd.setBounds (152, rowDet, 56, 30); ta.setBounds (212, rowDet, 56, 30);
+    }
+private:
+    ParamHelp& ph; int band = 0;
+    ResetCombo type, slope; DragValue fq, gn, qv, th, rg, bl, at, rl, kn, sn, wd, ta;
+    Seg phaseSeg, chSeg, srcSeg;
+    juce::TextButton dynBtn, soloBtn; juce::Slider tb;
+    bool tbDrag = false, dynType = true, dotOver = false, thrOver = false, thrDrag = false, refreshing = false; juce::Rectangle<int> meterArea; int rowPhase = 82, rowTB = 202, rowDet = 230;
+    float thrStartDb = 0; int thrStartX = 0;
+};
+
+// =============================================================================
+//  Band saturator strip
+// =============================================================================
+class SatStrip : public juce::Component
+{
+public:
+    explicit SatStrip (ParamHelp& h) : ph (h), lo (h, "LOW"), hi (h, "HIGH"), drive (h, "DRIVE"), mix (h, "MIX"), os (h, { "1x", "2x", "4x" })
+    {
+        onBtn.setClickingTogglesState (false);
+        onBtn.onClick = [this] { ph.toggleGesture (pid::satOn); }; markReset (onBtn);
+        deltaBtn.onClick = [this] { ph.toggleGesture (pid::satDelta); }; markReset (deltaBtn);
+        autoBtn.onClick = [this] { ph.toggleGesture (pid::satAuto); }; markReset (autoBtn);
+        type.addItemList ({ "Tape", "Tube", "Clip", "Transformer", "Class A", "Exciter" }, 1);
+        markReset (type); type.onAlt = [this] { ph.resetDefault (pid::satType); };
+        type.onChange = [this] { ph.setGesture (pid::satType, (float) (type.getSelectedId() - 1)); };
+        lo.setParam (pid::satLo); hi.setParam (pid::satHi); drive.setParam (pid::satDrive); mix.setParam (pid::satMix); os.setParam (pid::satOS);
+        os.onColour = theme::sat;
+        for (auto* d : { &lo, &hi }) { d->format = [] (float v) { return fmtHz (v) + " Hz"; }; d->parse = parseHz; }
+        drive.format = [] (float v) { return juce::String (v, 1) + " dB"; };
+        mix.format = [] (float v) { return juce::String ((int) std::round (v)) + " %"; };
+        for (auto* d : { &lo, &hi, &drive, &mix }) { d->compact = true; d->valueColour = theme::sat; addAndMakeVisible (*d); }
+        setHelp (onBtn, "SAT", "帯域サチュレーターのオン・オフ。EQ の後ろで、選んだ帯域だけを歪ませる", "Band saturator on/off. After the EQ, drives only the chosen band");
+        setHelp (type, "SAT TYPE", "Tape：対称でなめらか／Tube：非対称、強く入れるほど太く／Clip：硬い／Transformer：低域ほど飽和しやすい／Class A：軽く入れても少し色が付く／Exciter：LOW より上に倍音だけを足す。注意：特定の機材の再現ではなく、回路の傾向を示すモデル",
+                 "Tape: smooth / Tube: asymmetric, fatter when pushed / Clip: hard / Transformer: lows saturate first / Class A: a little colour even when light / Exciter: adds harmonics above LOW only. Careful: tendencies, not models of specific units");
+        setHelp (lo, "LOW", "歪ませる帯域の下端。グラフ上部の SAT タブでも動かせる。Exciter ではここより上だけに倍音を足す", "Low edge of the driven band (also the SAT tab). Exciter adds harmonics only above it");
+        setHelp (hi, "HIGH", "歪ませる帯域の上端。グラフ上部の SAT タブでも動かせる", "High edge of the driven band. Also the SAT tab at the top of the graph");
+        setHelp (drive, "DRIVE", "歪みの量。小さい音の音量は変えずに、どれだけ潰すかだけを変える", "Amount of distortion; quiet material keeps its level");
+        setHelp (mix, "MIX", "歪ませた音と元の音の割合（パラレル）", "Blend of driven and clean band (parallel)");
+        setHelp (os, "OVERSAMPLING", "サチュレーターだけを 2 倍・4 倍のレートで処理し、折り返しノイズを減らす。1x と聴き比べると高域のザラつきの正体が分かる。注意：2x で CPU 約 2〜3 倍、4x で約 4〜6 倍。わずかなレイテンシーが加わる",
+                 "Runs the saturator at 2× / 4× to cut aliasing; compare with 1x to hear the grit. Careful: 2x costs about 2–3× CPU, 4x about 4–6×, plus a little latency");
+        setHelp (deltaBtn, "SAT Δ", "サチュレーターが足した成分（倍音と潰れ）だけを聴く", "Hear only what the saturator adds (harmonics and squash)");
+        setHelp (autoBtn, "AUTO LVL", "潰れたピークの分だけ帯域の RMS を戻し、音量差なしで音色を比べる（Exciter では働かない）", "Restores the RMS the peaks lost so you compare tone, not level (not used by Exciter)");
+        for (auto* c : { (juce::Component*) &onBtn, (juce::Component*) &deltaBtn, (juce::Component*) &autoBtn, (juce::Component*) &type, (juce::Component*) &os }) addAndMakeVisible (*c);
+    }
+    void refresh()
+    {
+        const bool on = ph.value (pid::satOn) > 0.5f;
+        os.onColour = theme::sat;
+        onBtn.setButtonText ("SAT"); onBtn.setToggleState (on, juce::dontSendNotification);
+        deltaBtn.setButtonText (juce::String::fromUTF8 ("Sat \xce\x94")); deltaBtn.setToggleState (ph.value (pid::satDelta) > 0.5f, juce::dontSendNotification);
+        autoBtn.setButtonText (juce::String ("Auto lvl")); autoBtn.setToggleState (ph.value (pid::satAuto) > 0.5f, juce::dontSendNotification);
+        const int t = (int) ph.value (pid::satType);
+        if (type.getSelectedId() != t + 1) type.setSelectedId (t + 1, juce::dontSendNotification);
+        for (auto* c : { (juce::Component*) &lo, (juce::Component*) &hi, (juce::Component*) &drive, (juce::Component*) &mix, (juce::Component*) &deltaBtn, (juce::Component*) &autoBtn, (juce::Component*) &type, (juce::Component*) &os })
+            c->setAlpha (on ? 1.0f : 0.45f);
+        lo.repaint(); hi.repaint(); drive.repaint(); mix.repaint(); os.repaint(); repaint();
+    }
+    void resized() override
+    {
+        int x = 8; const int y = 5, h = getHeight() - 10;
+        onBtn.setBounds (x, y + 3, 46, h - 6); x += 50;
+        type.setBounds (x, y + 3, 100, h - 6); x += 104;
+        lo.setBounds (x, y, 78, h); x += 82;
+        hi.setBounds (x, y, 78, h); x += 82;
+        drive.setBounds (x, y, 70, h); x += 74;
+        mix.setBounds (x, y, 56, h); x += 60;
+        os.setBounds (x, y + 5, 84, h - 10); x += 88;
+        deltaBtn.setBounds (x, y + 3, 56, h - 6); x += 60;
+        autoBtn.setBounds (x, y + 3, 64, h - 6); x += 68;
+        makeupArea = { x, y, 50, h }; x += 54;
+        curveArea = { x, y, 52, h }; x += 58;
+        textArea = { x, y, getWidth() - x - 8, h };
+    }
+    void paint (juce::Graphics& g) override
+    {
+        auto r = getLocalBounds().toFloat();
+        g.setColour (theme::panel); g.fillRoundedRectangle (r, 6.0f);
+        g.setColour (ph.value (pid::satOn) > 0.5f ? theme::sat.withAlpha (0.53f) : theme::line); g.drawRoundedRectangle (r.reduced (0.5f), 6.0f, 1.0f);
+        g.setColour (theme::muted); g.setFont (theme::ui (9.5f));
+        g.drawText ("MAKEUP", makeupArea.withHeight (14), juce::Justification::centredLeft);
+        g.setColour (ph.value (pid::satAuto) > 0.5f && ph.value (pid::satOn) > 0.5f ? theme::sat : theme::faint);
+        g.setFont (theme::mono (12.0f, true));
+        g.drawText (fmtDb (ph.value (pid::satOn) > 0.5f && ph.value (pid::satAuto) > 0.5f ? ph.proc.satMakeupDb.load() : 0.0f),
+                    makeupArea.withTrimmedTop (14), juce::Justification::centredLeft);
+        auto c = curveArea.toFloat();
+        g.setColour (theme::well); g.fillRoundedRectangle (c, 3.0f);
+        g.setColour (theme::grid); g.drawLine (c.getX(), c.getCentreY(), c.getRight(), c.getCentreY()); g.drawLine (c.getCentreX(), c.getY(), c.getCentreX(), c.getBottom());
+        g.setColour (theme::faint); g.drawLine (c.getX(), c.getBottom(), c.getRight(), c.getY(), 0.8f);
+        const float gd = juce::Decibels::decibelsToGain (ph.value (pid::satDrive)); const int t = (int) ph.value (pid::satType);
+        juce::Path p;
+        for (int i = 0; i <= 40; ++i)
+        {
+            const float x = -1.0f + 2.0f * i / 40.0f, y = juce::jlimit (-1.0f, 1.0f, BandSaturator::curve (t, x, gd));
+            const float px = c.getX() + (x + 1) * 0.5f * c.getWidth(), py = c.getCentreY() - y * 0.5f * c.getHeight();
+            if (i == 0) p.startNewSubPath (px, py); else p.lineTo (px, py);
+        }
+        g.setColour (theme::sat); g.strokePath (p, juce::PathStrokeType (1.5f));
+        static const char* ja[] = { "対称でなめらか。奇数倍音が中心", "非対称。偶数倍音が出て、強く入れるほど太くなる", "硬く角のある歪み",
+                                    "低域ほど飽和しやすい。低音の太さと密度感", "軽く入れても少し色が付く。中低域の厚み", "倍音だけを LOW より上に足す。こもらずに抜けが増える" };
+        static const char* en[] = { "Symmetric and smooth; mostly odd harmonics", "Asymmetric; even harmonics, fatter when pushed", "Hard, edgy clipping",
+                                    "Lows saturate first: weight and density", "A little colour even when light: low-mid body", "Adds harmonics above LOW only: more air without mud" };
+        g.setColour (theme::muted); g.setFont (theme::ui (10.0f));
+        g.drawFittedText (juce::String::fromUTF8 (ph.ja() ? ja[juce::jlimit (0, 5, t)] : en[juce::jlimit (0, 5, t)]), textArea, juce::Justification::centredLeft, 3, 0.9f);
+    }
+private:
+    ParamHelp& ph;
+    juce::TextButton onBtn, deltaBtn, autoBtn; ResetCombo type;
+    DragValue lo, hi, drive, mix; Seg os;
+    juce::Rectangle<int> curveArea, textArea, makeupArea;
+};
+
+// =============================================================================
+//  The big graph: magnitude, phase / group delay overlay, analyzer, nodes
+// =============================================================================
+class GraphView : public juce::Component
+{
+public:
+    explicit GraphView (ParamHelp& h) : ph (h), popup (h), scSens (h, "SENS dB"), scWidth (h, "WIDTH dB"), scAtt (h, "ATTACK ms"),
+        scLc (h, "LOW CUT"), scE1f (h, "EQ1 Hz"), scE1g (h, "EQ1 dB"), scE1q (h, "EQ1 Q"), scE2f (h, "EQ2 Hz"), scE2g (h, "EQ2 dB"), scE2q (h, "EQ2 Q"),
+        scMethod (h, { "Ratio", "Slope" })
+    {
+        addChildComponent (popup);
+        // T/B scope: the input's attack (Transient) and body share, scrolling, with the detector and its Sens / Width band
+        scopeBtn.setClickingTogglesState (false); scopeBtn.setButtonText ("T/B scope"); addAndMakeVisible (scopeBtn);
+        scopeBtn.onClick = [this] { ph.proc.uiState.setProperty ("scope", ! (bool) ph.proc.uiState.getProperty ("scope", false), nullptr); resized(); };
+        scSens.setParam (pid::tbSens); scWidth.setParam (pid::tbWidth); scAtt.setParam (pid::tbAtt);
+        scSens.format = [] (float v) { return fmtDb (v); };
+        scWidth.format = [] (float v) { return v == std::round (v) ? juce::String ((int) v) : juce::String (v, 1); };
+        scAtt.format = [] (float v) { return juce::String (v, 2); };
+        for (auto* d : { &scSens, &scWidth, &scAtt }) { d->compact = true; addChildComponent (*d); }
+        // detector-only EQ and the method: change what the detector hears, never the sound
+        scLc.setParam (pid::tbLc); scE1f.setParam (pid::tbE1f); scE1g.setParam (pid::tbE1g); scE1q.setParam (pid::tbE1q);
+        scE2f.setParam (pid::tbE2f); scE2g.setParam (pid::tbE2g); scE2q.setParam (pid::tbE2q); scMethod.setParam (pid::tbMethod);
+        scLc.format = [] (float v) { return v <= 20.5f ? juce::String ("Off") : fmtHz (v); };
+        for (auto* d : { &scLc, &scE1f, &scE2f }) d->parse = parseHz;
+        scE1f.format = scE2f.format = [] (float v) { return fmtHz (v); };
+        scE1g.format = scE2g.format = [] (float v) { return std::abs (v) < 0.05f ? juce::String ("0") : fmtDb (v); };
+        scE1q.format = scE2q.format = [] (float v) { return juce::String (v, 2); };
+        for (auto* d : { &scLc, &scE1f, &scE1g, &scE1q, &scE2f, &scE2g, &scE2q }) { d->compact = true; addChildComponent (*d); }
+        addChildComponent (scMethod);
+        setHelp (scLc, "DET LOW CUT", "検出器だけに掛かるローカット（12 dB/oct、Off＝20 Hz）。出力の音は変わらない。キックやベースの低域の揺れでアタック判定が乱れる時に 80〜150 Hz", "Low cut for the detector only (12 dB/oct, Off = 20 Hz); the output is untouched. Try 80–150 Hz when low-end swells confuse the attack detection");
+        for (auto* d : { &scE1f, &scE1g, &scE1q, &scE2f, &scE2g, &scE2q })
+            setHelp (*d, "DET EQ 1 / 2", "検出器だけに掛かるベル EQ 2 つ（ゲイン 0 で無効）。出力の音は変わらない。例：スネアのアタックを拾いたい時は 2〜5 kHz を +6〜12 dB、ハイハットに反応させたくない時は 8 kHz 付近を −12 dB", "Two bells for the detector only (0 dB = off); the output is untouched. E.g. +6 to +12 dB at 2–5 kHz to catch the snare's crack, −12 dB near 8 kHz to ignore hi-hats");
+        setHelp (scMethod, "DET METHOD", "検出の方式／Ratio：速い包絡÷遅い包絡（従来）。音量が上がった分だけを見る。持続音の中のアタックにも反応する／Slope：速い包絡が 5 ms で何 dB 上がったか。立ち上がりの速さだけを見るので、ゆっくり膨らむ音はアタックにならない。注意：Slope は SENS・WIDTH の効き方が変わる（WIDTH は dB／5 ms）",
+                 "Detection method / Ratio: fast ÷ slow envelope (the original); how far the level jumps above the recent body / Slope: how many dB the fast envelope rose in 5 ms; only the speed of the rise counts, so slow swells never become attack. Careful: SENS and WIDTH act differently with Slope (WIDTH is dB per 5 ms)");
+        for (int i = 0; i < 4; ++i) scSpan.addItem (juce::String (spans()[i], 0) + " s", i + 1);
+        scSpan.setSelectedId (1 + juce::jlimit (0, 3, (int) ph.proc.uiState.getProperty ("scopeSpan", 1)), juce::dontSendNotification);
+        scSpan.onChange = [this] { ph.proc.uiState.setProperty ("scopeSpan", scSpan.getSelectedId() - 1, nullptr); };
+        scPause.setClickingTogglesState (false); scPause.setButtonText (juce::String::fromUTF8 ("\xe2\x9d\x9a\xe2\x9d\x9a Pause"));
+        scPause.onClick = [this] { setPaused (! scPaused); };
+        addChildComponent (scSpan); addChildComponent (scPause);
+        setHelp (scSpan, "SCOPE SPAN", "スコープに出す時間の長さ。1 s は 1 本ずつのアタックの形、8 s はフレーズ全体の傾向を見る", "How much time the scope shows. 1 s for the shape of single hits, 8 s for the whole phrase");
+        setHelp (scPause, "SCOPE PAUSE", "スコープを止める。止めたまま SENS／WIDTH／ATTACK を動かすと、同じ音で色分けがどう変わるかが分かる。音は止まらない", "Freezes the scope. Move SENS / WIDTH / ATTACK while paused to see how the same audio is split. Playback is not affected");
+        setHelp (scopeBtn, "T/B SCOPE", "入力の波形を約 2 秒分スクロール表示し、検出器がアタック（Transient＝オレンジ）と胴（Body＝青緑）に分けた割合で色分けする。下の線は検出器の値（速い包絡÷遅い包絡、dB）、黄色の帯はマスクが 0→1 に上がる範囲。帯の下の線（青緑）をドラッグで SENS、上の線（オレンジ）で WIDTH。Split では位相の枠、Overlay では下の部分に重なる",
+                 "Scrolls about 2 s of the input and colours it by how the detector splits it: attack (Transient, orange) and body (Body, teal). The line below is the detector (fast ÷ slow envelope, dB); the yellow band is where the mask rises from 0 to 1. Drag its lower (teal) line for SENS and its upper (orange) line for WIDTH. In Split it sits in the phase panel, in Overlay over the lower part");
+        setHelp (scSens, "T/B SENS", "検出器の感度（dB）。＋で帯が下がり、アタックと判定されやすくなる。全バンド共通", "Detector sensitivity (dB). Plus lowers the band, so more counts as attack. Shared by all bands");
+        setHelp (scWidth, "T/B WIDTH", "マスクが 0→1 に上がる幅（dB）。小さいほどハード", "Width over which the mask rises 0 → 1 (dB). Smaller is harder");
+        setHelp (scAtt, "T/B ATTACK", "マスクが上がる速さ（ms、既定 2）。小さいほどアタックの頭が Body に漏れにくい", "How fast the mask rises (ms, default 2). Smaller keeps the front of the attack out of Body");
+        for (auto* b : { &phaseBtn, &gdBtn, &overlayBtn, &splitBtn }) { b->setClickingTogglesState (false); addAndMakeVisible (*b); }
+        overlayBtn.setButtonText ("Overlay"); splitBtn.setButtonText ("Split");
+        overlayBtn.onClick = [this] { ph.proc.uiState.setProperty ("split", false, nullptr); resized(); };
+        splitBtn.onClick   = [this] { ph.proc.uiState.setProperty ("split", true, nullptr); resized(); };
+        setHelp (overlayBtn, "OVERLAY", "位相（群遅延）を振幅カーブに重ねて表示", "Draw phase (or group delay) over the magnitude curve");
+        setHelp (splitBtn, "SPLIT", "位相（群遅延）を下の別枠に分けて表示。±360° 回る急なカットも読みやすい。振幅の表示は縦が約 2/3 になる",
+                 "Phase (or group delay) in its own panel below; easier to read for steep cuts. The magnitude view gets about 2/3 as tall");
+        phaseBtn.onClick = [this] { ph.proc.uiState.setProperty ("view", 0, nullptr); };
+        setHelp (*this, "MOUSE", mouseHelpJa(), mouseHelpEn());
+        setHelp (phaseBtn, "PHASE", "黄色の点線を位相表示に。±360°", "Show phase as the yellow dotted line (±360°)");
+        setHelp (gdBtn, "GROUP DELAY", "黄色の点線を群遅延（周波数ごとの遅れ、ms）表示に", "Show group delay — the delay at each frequency, in ms");
+        gdBtn.onClick    = [this] { ph.proc.uiState.setProperty ("view", 1, nullptr); };
+        for (int i = 0; i <= 400; ++i) fr.push_back (20.0 * std::pow (1000.0, i / 400.0));
+        spectrum.assign (fr.size(), -140.0f); spectrumB.assign (fr.size(), -140.0f);
+
+        // analyzer layers: A is filled, B (optional) is a line on top
+        static const char* names[] = { "Stereo", "Mid", "Side", "Trans", "Body" };
+        anaB.addItem ("B off", 1);
+        for (int i = 0; i < 5; ++i) { anaA.addItem (juce::String ("A ") + names[i], i + 1); anaB.addItem (juce::String ("B ") + names[i], i + 2); }
+        anaA.setSelectedId (1 + juce::jlimit (0, 4, (int) ph.proc.uiState.getProperty ("anA", 0)), juce::dontSendNotification);
+        anaB.setSelectedId (1 + juce::jlimit (0, 5, (int) ph.proc.uiState.getProperty ("anB", 0)), juce::dontSendNotification);
+        anaA.onChange = [this] { ph.proc.uiState.setProperty ("anA", anaA.getSelectedId() - 1, nullptr); };
+        anaB.onChange = [this] { ph.proc.uiState.setProperty ("anB", anaB.getSelectedId() - 1, nullptr); };
+        addAndMakeVisible (anaA); addAndMakeVisible (anaB);
+        const char* hj = "スペアナに出す音を選ぶ。A は塗り、B は線で重なる（B off で非表示）。Stereo＝Mid と Side のパワー和（L/R の平均）／Mid・Side＝出力の M/S／Trans・Body＝検出器が聞いている「アタック／胴」の音。注意：Trans・Body は検出器の見立てを出力に掛けた表示で、厳密な分離ではない（掛け算なので、元の音との合計は一致しない）";
+        const char* he = "Choose what the analyzer shows. A is filled, B is a line on top (B off hides it). Stereo = power sum of Mid and Side (mean of L and R) / Mid, Side = the output's M/S / Trans, Body = the part the detector hears as attack or body. Careful: Trans and Body show the detector's guess applied to the output, not a strict separation";
+        setHelp (anaA, "ANALYZER A", hj, he); setHelp (anaB, "ANALYZER B", hj, he);
+    }
+
+    void update (const std::vector<float>& specDb, const std::vector<float>& specDbB)    // called ~30x per second by the editor
+    {
+        {
+            // SOLO M / S → Mid + Side, SOLO T / B → Trans + Body, shown but not stored; the saved choice returns after the solo
+            int a = juce::jlimit (0, 4, (int) ph.proc.uiState.getProperty ("anA", 0)), b = juce::jlimit (0, 5, (int) ph.proc.uiState.getProperty ("anB", 0));
+            const int sv = ph.proc.soloViewEffective();
+            autoAna = sv != 0;
+            if (sv == 1 || sv == 2) { a = 1; b = 3; } else if (sv >= 3) { a = 3; b = 5; }
+            if (anaA.getSelectedId() != a + 1) anaA.setSelectedId (a + 1, juce::dontSendNotification);
+            if (anaB.getSelectedId() != b + 1) anaB.setSelectedId (b + 1, juce::dontSendNotification);
+            anaA.setEnabled (! autoAna); anaB.setEnabled (! autoAna);
+            srcA = a; srcB = b - 1;
+        }
+        {
+            const bool sc = (bool) ph.proc.uiState.getProperty ("scope", false) && ! ph.proc.earActive();
+            scopeBtn.setToggleState (sc, juce::dontSendNotification);
+            ph.proc.scopeNeed = sc;
+            if (sc != lastScope) { lastScope = sc; if (sc) { scEnableW = ph.proc.scopeRawW.load(); scSig = {}; } else if (scPaused) setPaused (false); resized(); }
+            if (sc) scopeTick();
+        }
+        if (specDbB.size() == spectrumB.size()) spectrumB = specDbB;
+        const bool gd = (int) ph.proc.uiState.getProperty ("view", 0) == 1;
+        phaseBtn.setToggleState (! gd, juce::dontSendNotification); gdBtn.setToggleState (gd, juce::dontSendNotification);
+        phaseBtn.setButtonText (juce::String ("Phase")); gdBtn.setButtonText (juce::String ("GD"));
+        // recompute curves only when something changed
+        const bool split = (bool) ph.proc.uiState.getProperty ("split", false);
+        overlayBtn.setToggleState (! split, juce::dontSendNotification); splitBtn.setToggleState (split, juce::dontSendNotification);
+        if (split != lastSplit) { lastSplit = split; resized(); }
+        juce::String sig; sig << (int) ph.proc.currentMode() << (int) ph.proc.currentQMode();
+        const auto bands = ph.proc.currentBands();
+        for (auto& b : bands) sig << (int) b.on << (int) b.type << b.slope << "_" << b.f << "_" << b.g << "_" << b.q << (int) b.lin << b.ch;
+        sig << ph.selected();
+        if (sig != lastSig)
+        {
+            lastSig = sig;
+            const double fs = ph.proc.getSampleRateOrDefault();
+            const auto qm = ph.proc.currentQMode(); const auto mode = ph.proc.currentMode();
+            anyMS = false; for (auto& b : bands) anyMS = anyMS || (b.on && b.ch != 0);
+            cur = eqcore::curves (eqcore::channelModel (bands, qm, fs, mode, 1), fr);
+            curS = anyMS ? eqcore::curves (eqcore::channelModel (bands, qm, fs, mode, 2), fr) : eqcore::CurvesV2();
+            ghost = eqcore::Curves();
+            if (mode == eqcore::Mode::ZeroLatency)
+            {
+                auto allMin = bands; for (auto& b : allMin) b.lin = false;
+                ghost = eqcore::curves (eqcore::channelModel (allMin, qm, fs, eqcore::Mode::Analog, 1), fr);
+            }
+            const int s = ph.selected();
+            std::array<eqcore::Band, 6> one {}; one[0] = bands[(size_t) s]; one[0].ch = 0;
+            selCurve = bands[(size_t) s].on ? eqcore::curves (eqcore::channelModel (one, qm, fs, mode, 1), fr).mag : std::vector<double>();
+        }
+        // dynamic EQ: the curve as it is right now
+        {
+            auto live = bands; bool moving = false;
+            for (int i = 0; i < 6; ++i)
+            {
+                const float d = ph.proc.dynGainDb[(size_t) i].load();
+                if (std::abs (d) > 0.05f) { live[(size_t) i].g += d; moving = true; }
+            }
+            liveMag = moving ? eqcore::curves (eqcore::channelModel (live, ph.proc.currentQMode(), ph.proc.getSampleRateOrDefault(), ph.proc.currentMode(), 1), fr).mag
+                             : std::vector<double>();
+        }
+        if (specDb.size() == spectrum.size()) spectrum = specDb;
+        const int s = ph.selected();
+        const int keep = (int) ph.proc.uiState.getProperty ("keepOff", -1);
+        if (keep >= 0 && (keep != s || bands[(size_t) s].on)) ph.proc.uiState.setProperty ("keepOff", -1, nullptr);
+        popup.setVisible ((bands[(size_t) s].on || keep == s) && (bool) ph.proc.uiState.getProperty ("popup", true) && ! ph.proc.earActive());
+        // keep the panel still while one of its values is being dragged or typed
+        if (popup.isVisible()) { popup.refresh (s); if (! popup.isBusy()) placePopup(); }
+        repaint();
+    }
+
+    void resized() override
+    {
+        gdBtn.setBounds (getWidth() - 50, 6, 42, 20);
+        phaseBtn.setBounds (getWidth() - 96, 6, 46, 20);
+        splitBtn.setBounds (getWidth() - 150, 6, 46, 20);
+        overlayBtn.setBounds (getWidth() - 206, 6, 56, 20);
+        anaA.setBounds (42, 6, 84, 20); anaB.setBounds (130, 6, 84, 20);
+        scopeBtn.setBounds (220, 6, 74, 20);
+        {
+            const auto a = scopeArea();
+            int x = (int) a.getX() + 150;
+            for (auto* d : { &scSens, &scWidth, &scAtt }) { d->setBounds (x, (int) a.getY() + 1, 70, 28); x += 74; d->setVisible (lastScope); }
+            scSpan.setBounds (x, (int) a.getY() + 5, 62, 20); x += 66;
+            scPause.setBounds (x, (int) a.getY() + 5, 58, 20);
+            scSpan.setVisible (lastScope); scPause.setVisible (lastScope);
+            x = (int) a.getX() + 60;
+            const int y2 = (int) a.getY() + 31;
+            for (auto* d : { &scLc, &scE1f, &scE1g, &scE1q, &scE2f, &scE2g, &scE2q }) { d->setBounds (x, y2, 62, 28); x += (d == &scLc || d == &scE1q) ? 74 : 64; d->setVisible (lastScope); }
+            scMethod.setBounds (x + 14, y2 + 4, 120, 20); scMethod.setVisible (lastScope);
+        }
+        placePopup();
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        auto r = getLocalBounds().toFloat();
+        g.setColour (theme::well); g.fillRoundedRectangle (r, 6.0f);
+        g.setColour (theme::line); g.drawRoundedRectangle (r.reduced (0.5f), 6.0f, 1.0f);
+        const auto pr = plot();
+        const bool split = lastSplit;
+        const bool ear = ph.proc.earActive();
+
+        // analyzer
+        if (! ear)
+        {
+            juce::Path p; p.startNewSubPath (pr.getX(), pr.getBottom());
+            for (size_t i = 0; i < fr.size(); ++i)
+            {
+                const float y = juce::jmap (juce::jlimit (-90.0f, -10.0f, spectrum[i]), -90.0f, -10.0f, pr.getBottom(), pr.getY());
+                p.lineTo (xOf (fr[i]), y);
+            }
+            p.lineTo (pr.getRight(), pr.getBottom()); p.closeSubPath();
+            // A is the main layer: brighter fill; B is a quieter line on top. Trans / Body / Side get their own colours
+            const juce::Colour ca = srcColour (srcA, theme::analyzer.interpolatedWith (theme::text, 0.22f));
+            g.setColour (ca.withAlpha (srcA >= 3 || srcA == 2 ? 0.55f : 0.85f)); g.fillPath (p);
+            if (srcB >= 0)
+            {
+                juce::Path q;
+                for (size_t i = 0; i < fr.size(); ++i)
+                {
+                    const float y = juce::jmap (juce::jlimit (-90.0f, -10.0f, spectrumB[i]), -90.0f, -10.0f, pr.getBottom(), pr.getY());
+                    if (i == 0) q.startNewSubPath (xOf (fr[i]), y); else q.lineTo (xOf (fr[i]), y);
+                }
+                g.setColour (srcColour (srcB, theme::text).withAlpha (0.5f)); g.strokePath (q, juce::PathStrokeType (1.0f));
+            }
+        }
+        // grid
+        g.setFont (theme::mono (10.0f));
+        auto vgrid = [&] (juce::Rectangle<float> a)
+        {
+            for (double f : { 30., 40., 50., 60., 70., 80., 90., 100., 200., 300., 400., 500., 600., 700., 800., 900., 1000., 2000., 3000., 4000., 5000., 6000., 7000., 8000., 9000., 10000. })
+            { g.setColour (theme::grid); g.drawVerticalLine ((int) xOf (f), a.getY(), a.getBottom()); }
+        };
+        vgrid (pr);
+        const auto lp = labelRow();
+        for (double f : { 50., 100., 200., 500., 1000., 2000., 5000., 10000. })
+        { g.setColour (theme::faint); g.drawText (fmtHz (f), (int) xOf (f) - 20, (int) lp, 40, 14, juce::Justification::centred); }
+        for (int db = -18; db <= 18; db += 6)
+        {
+            const float y = yOf (db);
+            g.setColour (db == 0 ? theme::zero : theme::grid); g.drawHorizontalLine ((int) y, pr.getX(), pr.getRight());
+            if (std::abs (db) < 18) { g.setColour (theme::faint); g.drawText (fmtDb (db, 0), 2, (int) y - 7, (int) pr.getX() - 6, 14, juce::Justification::centredRight); }
+        }
+        if (ear)
+        {
+            g.setColour (theme::accent.withAlpha (0.35f)); g.setFont (theme::mono (90.0f, true));
+            g.drawText ("?", pr, juce::Justification::centred);
+            g.setColour (theme::muted); g.setFont (theme::ui (12.0f));
+            g.drawText (ph.tr ("耳トレ中：カーブとアナライザーは隠しています", "Ear training: curve and analyzer are hidden"), pr.withTrimmedTop (pr.getHeight() * 0.7f), juce::Justification::centredTop);
+            return;
+        }
+
+        // saturator band
+        if (ph.value (pid::satOn) > 0.5f)
+        {
+            const float x0 = xOf (ph.value (pid::satLo)), x1 = xOf (ph.value (pid::satHi));
+            const juce::Colour sc (0xffe8a33a);
+            g.setColour (sc.withAlpha (0.06f)); g.fillRect (x0, pr.getY(), x1 - x0, pr.getHeight());
+            const float dash[] = { 3.0f, 4.0f };
+            g.setColour (sc.withAlpha (0.55f));
+            g.drawDashedLine ({ x0, pr.getY(), x0, pr.getBottom() }, dash, 2, 1.0f);
+            g.drawDashedLine ({ x1, pr.getY(), x1, pr.getBottom() }, dash, 2, 1.0f);
+            g.setFont (theme::mono (9.0f, true));
+            for (auto x : { x0, x1 })
+            {
+                auto tab = juce::Rectangle<float> (x - 15, pr.getY() + 2, 30, 16);
+                g.setColour (sc.withAlpha (0.85f)); g.fillRoundedRectangle (tab, 3.0f);
+                g.setColour (theme::onAccent); g.drawText ("SAT", tab, juce::Justification::centred);
+            }
+        }
+        if (cur.mag.empty()) return;
+        const int s = ph.selected();
+        if (! selCurve.empty())
+        {
+            juce::Path p; p.startNewSubPath (xOf (fr.front()), yOf (0));
+            for (size_t i = 0; i < fr.size(); ++i) p.lineTo (xOf (fr[i]), yOf (juce::jlimit (-20.0, 20.0, selCurve[i])));
+            p.lineTo (xOf (fr.back()), yOf (0)); p.closeSubPath();
+            g.setColour (theme::bandColour (s).withAlpha (0.16f)); g.fillPath (p);
+        }
+        // phase / group delay: over the curve (right scale) or in its own panel
+        const bool gd = (int) ph.proc.uiState.getProperty ("view", 0) == 1;
+        const double R = gd ? 20.0 : 360.0;
+        {
+            const auto pp = split ? phasePlot() : pr;
+            if (split)
+            {
+                g.setColour (theme::splitWell); g.fillRect (pp.expanded (0, 4));
+                vgrid (pp);
+                g.setColour (theme::zero); g.drawHorizontalLine ((int) pp.getCentreY(), pp.getX(), pp.getRight());
+            }
+            auto trace = [&] (const eqcore::CurvesV2& c, juce::Colour col, float alpha)
+            {
+                juce::Path p; bool first = true;
+                for (size_t i = 0; i < fr.size(); ++i)
+                {
+                    const double v = juce::jlimit (-R, R, gd ? c.gd[i] : c.phase[i]);
+                    const float x = xOf (fr[i]), y = juce::jmap ((float) v, (float) -R, (float) R, pp.getBottom(), pp.getY());
+                    if (first) { p.startNewSubPath (x, y); first = false; } else p.lineTo (x, y);
+                }
+                if (split) { g.setColour (col.withAlpha (alpha)); g.strokePath (p, juce::PathStrokeType (2.0f)); }
+                else { juce::Path dashed; const float dash[] = { 2.0f, 4.0f }; juce::PathStrokeType (2.0f).createDashedStroke (dashed, p, dash, 2); g.setColour (col.withAlpha (alpha)); g.fillPath (dashed); }
+            };
+            if (anyMS && ! curS.mag.empty()) trace (curS, theme::side, 0.6f);
+            trace (cur, theme::phase, 0.85f);
+            g.setFont (theme::mono (10.0f));
+            for (int k = -2; k <= 2; ++k)
+            {
+                const double v = R * k / 2.0;
+                const float y = juce::jmap ((float) v, (float) -R, (float) R, pp.getBottom(), pp.getY());
+                const juce::String t = (v > 0 ? "+" : v < 0 ? juce::String::fromUTF8 ("\xe2\x88\x92") : "") + juce::String ((int) std::abs (v)) + (gd ? " ms" : juce::String::fromUTF8 ("\xc2\xb0"));
+                g.setColour (theme::phase.withAlpha (0.8f));
+                g.drawText (t, (int) pp.getRight() - 64, juce::jlimit ((int) pp.getY() + (split ? 0 : 26), (int) pp.getBottom() - 14, (int) y - 7), 60, 14, juce::Justification::centredRight);
+            }
+        }
+        if (lastScope) paintScope (g);
+        // analog ideal (zero latency only): shows the cramping near Nyquist
+        if (! ghost.mag.empty())
+        {
+            juce::Path p; for (size_t i = 0; i < fr.size(); ++i) { const float x = xOf (fr[i]), y = yOf (juce::jlimit (-20.0, 20.0, ghost.mag[i])); if (i == 0) p.startNewSubPath (x, y); else p.lineTo (x, y); }
+            juce::Path d; const float dash[] = { 4.0f, 3.0f }; juce::PathStrokeType (1.2f).createDashedStroke (d, p, dash, 2);
+            g.setColour (theme::muted.withAlpha (0.6f)); g.fillPath (d);
+        }
+        // side channel
+        if (anyMS && ! curS.mag.empty())
+        {
+            juce::Path p; for (size_t i = 0; i < fr.size(); ++i) { const float x = xOf (fr[i]), y = yOf (juce::jlimit (-20.0, 20.0, curS.mag[i])); if (i == 0) p.startNewSubPath (x, y); else p.lineTo (x, y); }
+            juce::Path d; const float dash[] = { 6.0f, 3.0f }; juce::PathStrokeType (2.0f).createDashedStroke (d, p, dash, 2);
+            g.setColour (theme::side); g.fillPath (d);
+        }
+        // magnitude (mid, or both when there are no M/S bands)
+        {
+            juce::Path p, fill;
+            for (size_t i = 0; i < fr.size(); ++i)
+            {
+                const float x = xOf (fr[i]), y = yOf (juce::jlimit (-20.0, 20.0, cur.mag[i]));
+                if (i == 0) { p.startNewSubPath (x, y); fill.startNewSubPath (x, yOf (0)); }
+                else p.lineTo (x, y);
+                fill.lineTo (x, y);
+            }
+            fill.lineTo (xOf (fr.back()), yOf (0)); fill.closeSubPath();
+            g.setColour (theme::curve.withAlpha (0.08f)); g.fillPath (fill);
+            g.setColour (liveMag.empty() ? theme::curve : theme::curve.withAlpha (0.45f));
+            g.strokePath (p, juce::PathStrokeType (liveMag.empty() ? 2.6f : 1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        }
+        if (! liveMag.empty())
+        {
+            juce::Path p;
+            for (size_t i = 0; i < fr.size(); ++i) { const float x = xOf (fr[i]), y = yOf (juce::jlimit (-20.0, 20.0, liveMag[i])); if (i == 0) p.startNewSubPath (x, y); else p.lineTo (x, y); }
+            g.setColour (theme::live); g.strokePath (p, juce::PathStrokeType (2.4f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        }
+        // Delta: what the Delta button plays, |H − 1|
+        if (ph.value (pid::delta) > 0.5f)
+        {
+            juce::Path p;
+            for (size_t i = 0; i < fr.size(); ++i) { const float x = xOf (fr[i]), y = yOf (juce::jlimit (-20.0, 20.0, cur.delta[i])); if (i == 0) p.startNewSubPath (x, y); else p.lineTo (x, y); }
+            juce::Path d; const float dash[] = { 6.0f, 3.0f }; juce::PathStrokeType (2.2f).createDashedStroke (d, p, dash, 2);
+            g.setColour (theme::pre); g.fillPath (d);
+            auto box = juce::Rectangle<float> (pr.getX() + 8, pr.getY() + 24, 330, 40);
+            g.setColour (theme::pre.withAlpha (0.14f)); g.fillRoundedRectangle (box, 5.0f);
+            g.setColour (theme::pre.withAlpha (0.5f)); g.drawRoundedRectangle (box, 5.0f, 1.0f);
+            g.setColour (theme::pre); g.setFont (theme::ui (10.5f, true));
+            g.drawText (juce::String::fromUTF8 ("Delta |H \xe2\x88\x92 1|"), box.reduced (8, 4).withHeight (14), juce::Justification::centredLeft);
+            g.setColour (theme::text); g.setFont (theme::ui (10.0f));
+            g.drawFittedText (ph.tr ("位相が 60° 以上回る帯域と +6 dB を超えるブーストでは、差分が原音（0 dB）より大きくなる。異常ではない",
+                                     "Where the phase turns more than 60°, or a boost exceeds +6 dB, the difference is louder than the input (0 dB). That is expected"),
+                              box.reduced (8, 4).withTrimmedTop (14).toNearestInt(), juce::Justification::centredLeft, 2, 0.9f);
+        }
+        // dynamic bands: range bar from the static gain to gain + range, dot = now
+        {
+            const auto bs = ph.proc.currentBands();
+            for (int i = 0; i < 6; ++i)
+            {
+                const auto& b = bs[(size_t) i];
+                if (! b.on || ph.value (pid::band (i, "dyn")) < 0.5f) continue;
+                if (! (b.type == eqcore::Type::Bell || b.type == eqcore::Type::LowShelf || b.type == eqcore::Type::HighShelf)) continue;
+                const float a = ph.value (pid::band (i, "range")), bl = ph.value (pid::band (i, "below"));
+                const float x = xOf (b.f) + 16;
+                const float y0 = yOf (juce::jlimit (-20.0, 20.0, b.g + std::min (0.0f, std::min (a, bl)))), y1 = yOf (juce::jlimit (-20.0, 20.0, b.g + std::max (0.0f, std::max (a, bl))));
+                g.setColour (theme::bandColour (i).withAlpha (0.35f)); g.fillRoundedRectangle (x - 2, std::min (y0, y1), 4, std::abs (y1 - y0) + 1, 2);
+                const float yn = yOf (juce::jlimit (-20.0, 20.0, b.g + (double) ph.proc.dynGainDb[(size_t) i].load()));
+                g.setColour (theme::bandColour (i)); g.fillEllipse (x - 4, yn - 4, 8, 8);
+            }
+        }
+        // width handles
+        if (auto h = handles (s); h.has_value())
+        {
+            g.setColour (theme::bandColour (s));
+            const float dash[] = { 3.0f, 3.0f };
+            g.drawDashedLine ({ h->first, h->second }, dash, 2, 1.0f);
+            for (auto pt : { h->first, h->second })
+            {
+                g.setColour (theme::well); g.fillRoundedRectangle (pt.x - 4, pt.y - 9, 8, 18, 3);
+                g.setColour (theme::bandColour (s)); g.drawRoundedRectangle (pt.x - 4, pt.y - 9, 8, 18, 3, 2.0f);
+            }
+        }
+        // nodes, with Lin / M / S / D tags underneath
+        const auto bands = ph.proc.currentBands();
+        const int solo = ph.proc.soloBand.load();
+        for (int i = 0; i < 6; ++i)
+        {
+            const auto c = nodePos (i, bands[(size_t) i]);
+            const float rad = i == s ? 11.0f : 8.0f;
+            if (bands[(size_t) i].on)
+            {
+                g.setColour (theme::bandColour (i)); g.fillEllipse (c.x - rad, c.y - rad, rad * 2, rad * 2);
+                g.setColour (theme::well); g.drawEllipse (c.x - rad, c.y - rad, rad * 2, rad * 2, 2.5f);
+                if (i == s) { g.setColour (theme::bandColour (i)); g.drawEllipse (c.x - rad - 3, c.y - rad - 3, rad * 2 + 6, rad * 2 + 6, 1.5f); }
+                if (i == (int) ph.proc.uiState.getProperty ("focus", -1) || (i == ph.selected() && (double) ph.proc.uiState.getProperty ("focusUntil", 0.0) > juce::Time::getMillisecondCounterHiRes()))
+                    if ((double) ph.proc.uiState.getProperty ("focusUntil", 0.0) > juce::Time::getMillisecondCounterHiRes())
+                    {
+                        const float ph2 = (float) std::fmod (juce::Time::getMillisecondCounterHiRes() / 600.0, 1.0);
+                        const float rr = rad + 6 + 10 * ph2;
+                        g.setColour (theme::bandColour (i).withAlpha (0.8f * (1 - ph2))); g.drawEllipse (c.x - rr, c.y - rr, rr * 2, rr * 2, 2.0f);
+                    }
+                if (i == solo) { g.setColour (theme::pre); g.drawEllipse (c.x - rad - 6, c.y - rad - 6, rad * 2 + 12, rad * 2 + 12, 1.5f); }
+                g.setColour (theme::onAccent);
+            }
+            else
+            {
+                g.setColour (theme::well); g.fillEllipse (c.x - rad, c.y - rad, rad * 2, rad * 2);
+                g.setColour (theme::bandColour (i).withAlpha (0.7f)); g.drawEllipse (c.x - rad, c.y - rad, rad * 2, rad * 2, 1.5f);
+            }
+            g.setFont (theme::mono (10.0f, true));
+            g.drawText (juce::String (i + 1), juce::Rectangle<float> (c.x - rad, c.y - rad, rad * 2, rad * 2), juce::Justification::centred);
+            if (bands[(size_t) i].on)
+            {
+                const auto tag = bandTag (i, bands[(size_t) i]);
+                if (tag.isNotEmpty())
+                {
+                    g.setColour (theme::bandColour (i)); g.setFont (theme::mono (8.5f, true));
+                    g.drawText (tag, juce::Rectangle<float> (c.x - 40, c.y + rad + 2, 80, 11), juce::Justification::centred);
+                }
+            }
+        }
+        // labels
+        g.setFont (theme::ui (10.5f, true));
+        g.setColour (theme::muted);
+        g.drawText (anyMS ? juce::String ("Magnitude dB  -  Mid (solid) / Side (dashed)") : juce::String ("Magnitude dB (left)"), (int) pr.getX() + 6, 8, 300, 16, juce::Justification::centredLeft);
+        g.setColour (theme::phase.withAlpha (0.85f));
+        const juce::String ptxt = gd ? juce::String ("Group delay") : juce::String ("Phase");
+        if (autoAna) { g.setColour (theme::accent); g.setFont (theme::ui (9.5f, true)); g.drawText ("SOLO auto", 300, 6, 70, 20, juce::Justification::centredLeft); g.setColour (theme::phase.withAlpha (0.85f)); g.setFont (theme::ui (10.5f, true)); }
+        if (split && ! lastScope) g.drawText (ptxt, (int) phasePlot().getX() + 6, (int) phasePlot().getY() + 2, 200, 14, juce::Justification::centredLeft);
+        else g.drawText (ptxt + " (right, dotted)", getWidth() - 420, 8, 210, 16, juce::Justification::centredRight);
+    }
+
+    // ---- mouse ----
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu())
+        {
+            ph.proc.uiState.setProperty ("popup", ! (bool) ph.proc.uiState.getProperty ("popup", true), nullptr);
+            lastRightClick = juce::Time::getMillisecondCounter();
+            drag = {}; return;
+        }
+        if (ph.proc.earActive()) return;
+        if (const int k = scopeHit (e.position); k != 0)
+        {
+            if (e.mods.isAltDown()) { ph.resetDefault (k == 1 ? pid::tbSens : pid::tbWidth); return; }
+            scDrag = k; scStartY = e.position.y; scStartSens = ph.value (pid::tbSens); scStartWidth = ph.value (pid::tbWidth);
+            ph.proc.undo.beginNewTransaction(); ph.begin (k == 1 ? pid::tbSens : pid::tbWidth); return;
+        }
+        drag = pick (e.position);
+        if (drag.what >= 3) { ph.begin (drag.what == 3 ? pid::satLo : pid::satHi); return; }
+        if (drag.band < 0) return;
+        ph.select (drag.band);
+        if (e.mods.isAltDown()) { altSolo = true; ph.proc.soloBand = drag.band; }
+        downPos = e.position; axis = 0;
+        startF = ph.value (pid::band (drag.band, "freq")); startG = ph.value (pid::band (drag.band, "gain"));
+        startQ = ph.value (pid::band (drag.band, "q")); startY = e.position.y;
+        for (auto w : { "freq", "gain", "q" }) ph.begin (pid::band (drag.band, w));
+        if (ph.value (pid::band (drag.band, "on")) < 0.5f) ph.setGesture (pid::band (drag.band, "on"), 1.0f);
+    }
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu()) return;
+        if (scDrag != 0)
+        {
+            const float dd = (scStartY - e.position.y) / dbPx() * (e.mods.isShiftDown() ? 0.2f : 1.0f);   // dB moved, up = +
+            if (scDrag == 1) ph.set (pid::tbSens, juce::jlimit (-12.0f, 12.0f, std::round ((scStartSens - dd) * 10.0f) / 10.0f));   // lower line = −Sens
+            else ph.set (pid::tbWidth, juce::jlimit (1.0f, 18.0f, std::round ((scStartWidth + dd) * 10.0f) / 10.0f));
+            return;
+        }
+        if (drag.what >= 3)
+        {
+            const char* id = drag.what == 3 ? pid::satLo : pid::satHi;
+            float f = (float) fOf (e.position.x);
+            if (drag.what == 3) f = std::min (f, ph.value (pid::satHi) / 1.06f); else f = std::max (f, ph.value (pid::satLo) * 1.06f);
+            ph.set (id, f); return;
+        }
+        if (drag.band < 0) return;
+        const int b = drag.band; const auto pr = plot();
+        const int t = (int) ph.value (pid::band (b, "type"));
+        if (drag.what == 0)
+        {
+            if (e.mods.isShiftDown()) { ph.set (pid::band (b, "q"), (float) juce::jlimit (0.1, 18.0, startQ * std::pow (1.015, startY - e.position.y))); return; }
+            startY = e.position.y; startQ = ph.value (pid::band (b, "q"));
+            // Cmd (Ctrl on Windows) + drag: lock to the first direction moved
+            if (e.mods.isCommandDown())
+            {
+                const auto d = e.position - downPos;
+                if (axis == 0 && d.getDistanceFromOrigin() > 4.0f) axis = std::abs (d.x) >= std::abs (d.y) ? 1 : 2;
+                if (axis == 0) return;
+            }
+            else axis = 0;
+            const bool noGain = t == (int) eqcore::Type::LowCut || t == (int) eqcore::Type::HighCut || t == (int) eqcore::Type::Notch || t == (int) eqcore::Type::AllPass;
+            ph.set (pid::band (b, "freq"), axis == 2 ? startF : (float) fOf (e.position.x));
+            if (! noGain) ph.set (pid::band (b, "gain"), axis == 1 ? startG : juce::jlimit (-18.0f, 18.0f, juce::jmap (e.position.y, pr.getBottom(), pr.getY(), -20.0f, 20.0f)));
+        }
+        else
+        {
+            // width handle: each one stays on its own side of the centre
+            const double f = ph.value (pid::band (b, "freq"));
+            const double side = drag.what == 2 ? 1.0 : -1.0;
+            const double d = side * std::log2 (fOf (e.position.x) / f);
+            const double oct = juce::jlimit (0.04, 6.0, 2.0 * std::max (0.02, d));
+            const double qt = 1.0 / (2.0 * std::sinh (std::log (2.0) / 2.0 * oct));
+            eqcore::Band eb; eb.type = (eqcore::Type) t; eb.g = ph.value (pid::band (b, "gain")); eb.q = ph.value (pid::band (b, "q"));
+            const double k = eqcore::effectiveQ (eb, ph.proc.currentQMode()) / eb.q;
+            ph.set (pid::band (b, "q"), (float) juce::jlimit (0.1, 18.0, qt / k));
+        }
+    }
+    void mouseUp (const juce::MouseEvent&) override
+    {
+        if (scDrag != 0) { ph.end (scDrag == 1 ? pid::tbSens : pid::tbWidth); scDrag = 0; return; }
+        if (drag.what >= 3) ph.end (drag.what == 3 ? pid::satLo : pid::satHi);
+        else if (drag.band >= 0) for (auto w : { "freq", "gain", "q" }) ph.end (pid::band (drag.band, w));
+        drag = {}; axis = 0;
+        if (altSolo) { altSolo = false; ph.proc.soloBand = -1; }
+    }
+    void mouseDoubleClick (const juce::MouseEvent& e) override
+    {
+        if (ph.proc.earActive()) return;
+        const auto p = pick (e.position);
+        if (p.what >= 3) return;
+        if (p.band >= 0 && p.what == 0) { const int b = p.band; ph.setGesture (pid::band (b, "on"), ph.value (pid::band (b, "on")) > 0.5f ? 0.0f : 1.0f); return; }
+        for (int i = 0; i < 6; ++i)
+            if (ph.value (pid::band (i, "on")) < 0.5f)
+            {
+                const auto pr = plot();
+                ph.setGesture (pid::band (i, "type"), 0); ph.setGesture (pid::band (i, "freq"), (float) fOf (e.position.x));
+                ph.setGesture (pid::band (i, "gain"), juce::jlimit (-18.0f, 18.0f, juce::jmap (e.position.y, pr.getBottom(), pr.getY(), -20.0f, 20.0f)));
+                ph.setGesture (pid::band (i, "q"), 1.0f); ph.setGesture (pid::band (i, "on"), 1.0f); ph.select (i);
+                return;
+            }
+    }
+    void mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w) override
+    {
+        // trackpads send zero-length and momentum events (also around a two-finger click): ignore them
+        if (w.isInertial || std::abs (w.deltaY) < 0.01f || ph.proc.earActive()) return;
+        if (juce::Time::getMillisecondCounter() - lastRightClick < 500) return;
+        auto p = pick (e.position); if (p.what >= 3) return;
+        const int b = p.band >= 0 ? p.band : ph.selected();
+        if (ph.value (pid::band (b, "on")) < 0.5f) return;
+        const float q = ph.value (pid::band (b, "q"));
+        const float dir = (w.isReversed ? -1.0f : 1.0f) * w.deltaY;
+        const float stepPow = juce::jlimit (-1.0f, 1.0f, dir * 4.0f);       // proportional, max ±10 % per event
+        ph.setGesture (pid::band (b, "q"), juce::jlimit (0.1f, 18.0f, q * std::pow (1.1f, stepPow)));
+    }
+    void mouseMove (const juce::MouseEvent& e) override
+    {
+        if (scopeHit (e.position) != 0) { setMouseCursor (juce::MouseCursor::UpDownResizeCursor); return; }
+        const auto p = pick (e.position);
+        setMouseCursor (p.what >= 1 ? juce::MouseCursor::LeftRightResizeCursor
+                        : p.band < 0 ? juce::MouseCursor::CrosshairCursor
+                        : e.mods.isCommandDown() ? juce::MouseCursor::UpDownLeftRightResizeCursor : juce::MouseCursor::DraggingHandCursor);
+    }
+
+private:
+    struct Pick { int band = -1; int what = 0; };   // what: 0 node, 1/2 width handles, 3/4 saturator band edges
+    juce::Rectangle<float> fullPlot() const { return getLocalBounds().toFloat().withTrimmedLeft (34).withTrimmedRight (8).withTrimmedTop (30).withTrimmedBottom (18); }
+    float splitFrac() const { return lastScope ? 0.46f : 0.64f; }       // the scope needs more room in the lower panel
+    juce::Rectangle<float> plot() const { auto p = fullPlot(); return lastSplit ? p.withHeight (p.getHeight() * splitFrac()) : p; }
+    juce::Rectangle<float> phasePlot() const { auto p = fullPlot(); return p.withTrimmedTop (p.getHeight() * splitFrac() + 22); }
+    // where the scope goes: the phase panel in Split, the lower part of the graph in Overlay
+    juce::Rectangle<float> scopeArea() const { if (lastSplit) return phasePlot(); auto p = plot(); return p.withTrimmedTop (p.getHeight() * 0.40f); }
+    juce::Rectangle<float> scopeWave() const { auto a = scopeArea().withTrimmedTop (62); return a.withHeight (a.getHeight() * 0.58f); }
+    juce::Rectangle<float> scopeDet() const { auto a = scopeArea().withTrimmedTop (62); return a.withTrimmedTop (a.getHeight() * 0.58f + 4); }
+    static constexpr float detLo = -12.0f, detHi = 30.0f;       // detector strip range, dB
+    float dbPx() const { return scopeDet().getHeight() / (detHi - detLo); }
+    float yDet (float db) const { const auto r = scopeDet(); return juce::jmap (juce::jlimit (detLo, detHi, db), detLo, detHi, r.getBottom(), r.getY()); }
+    static juce::Colour colT() { return juce::Colour (0xffff7a59); }
+    static juce::Colour colB() { return juce::Colour (0xff3fc9bd); }
+    static juce::Colour srcColour (int src, juce::Colour fallback) { return src == 3 ? colT() : src == 4 ? colB() : src == 2 ? theme::side : fallback; }
+    int scopeHit (juce::Point<float> p) const      // 1 = lower line (Sens), 2 = upper line (Width)
+    {
+        if (! lastScope || ph.proc.earActive() || ! scopeDet().expanded (0, 6).contains (p)) return 0;
+        const float s = ph.value (pid::tbSens), w = ph.value (pid::tbWidth);
+        const float y0 = yDet (-s), y1 = yDet (w - s);
+        if (std::abs (p.y - y1) <= 5.0f) return 2;
+        if (std::abs (p.y - y0) <= 5.0f) return 1;
+        return 0;
+    }
+    static const double* spans() { static const double s[] = { 1.0, 2.0, 4.0, 8.0 }; return s; }
+    double spanSec() const { return spans()[juce::jlimit (0, 3, (int) ph.proc.uiState.getProperty ("scopeSpan", 1))]; }
+    int colLen() const { return std::max (1, (int) std::round (ph.proc.getSampleRateOrDefault() * spanSec() / scCols)); }
+    float rawAt (juce::uint64 p) const
+    {
+        if (scPaused) return frozen[(size_t) (p - (frozenEnd - frozen.size()))];
+        return ph.proc.scopeRaw[(size_t) (p & (juce::uint64) (EQAnatomyProcessor::scopeRawN - 1))];
+    }
+    void scopeFeed (float x)
+    {
+        const double m = sdet.process (sdeq.active() ? sdeq.process ((double) x) : (double) x), ax = std::abs ((double) x);
+        sPk = std::max (sPk, ax); sAcc += ax; sAccT += ax * m; sDmax = std::max (sDmax, sdet.lastD);
+        if (++sCnt >= colLen())
+        {
+            cPk[(size_t) cW] = (float) sPk; cT[(size_t) cW] = (float) (sAcc > 1e-12 ? sAccT / sAcc : 0.0); cD[(size_t) cW] = (float) sDmax;
+            cW = (cW + 1) % scCols; sAcc = sAccT = sPk = 0; sDmax = -100; sCnt = 0;
+        }
+    }
+    // run the detector again over what is stored (after a change of span or Sens / Width / Attack, or while paused)
+    void scopeRebuild()
+    {
+        const double fs = ph.proc.getSampleRateOrDefault();
+        const juce::uint64 end = scPaused ? frozenEnd : ph.proc.scopeRawW.load (std::memory_order_acquire);
+        const juce::uint64 first = scPaused ? frozenEnd - frozen.size() : std::max (scEnableW, end > (juce::uint64) (EQAnatomyProcessor::scopeRawN - 16384) ? end - (juce::uint64) (EQAnatomyProcessor::scopeRawN - 16384) : (juce::uint64) 0);
+        const juce::uint64 L = (juce::uint64) colLen(), warm = (juce::uint64) (fs * 0.3);
+        const juce::uint64 start = std::max (first, end > L * scCols + warm ? end - (L * scCols + warm) : (juce::uint64) 0);
+        cPk.fill (0.0f); cT.fill (0.0f); cD.fill (-100.0f); cW = 0;
+        sdet.prepare (fs);
+        sdet.sens = ph.value (pid::tbSens); sdet.width = ph.value (pid::tbWidth); sdet.setAttack (ph.value (pid::tbAtt)); sdet.method = (int) ph.value (pid::tbMethod);
+        sdeq.prepare (fs);
+        sdeq.set (ph.value (pid::tbLc), ph.value (pid::tbE1f), ph.value (pid::tbE1g), ph.value (pid::tbE1q), ph.value (pid::tbE2f), ph.value (pid::tbE2g), ph.value (pid::tbE2q));
+        sAcc = sAccT = sPk = 0; sDmax = -100; sCnt = 0;
+        juce::uint64 p = start;
+        const juce::uint64 colsFrom = std::max (start + std::min (warm, end - start), end > L * scCols ? end - L * scCols : (juce::uint64) 0);
+        const juce::uint64 aligned = colsFrom + (end - colsFrom) % L;          // the last column ends exactly at "now"
+        for (; p < aligned; ++p) { const double x = (double) rawAt (p); sdet.process (sdeq.active() ? sdeq.process (x) : x); }
+        // leave empty columns on the left when there is not enough audio yet
+        cW = (int) ((scCols - (int) ((end - aligned) / L) % scCols) % scCols);
+        for (; p < end; ++p) scopeFeed (rawAt (p));
+        sRead = end;
+    }
+    void scopeTick()
+    {
+        juce::String sig; sig << ph.value (pid::tbSens) << "_" << ph.value (pid::tbWidth) << "_" << ph.value (pid::tbAtt) << "_" << spanSec() << "_" << ph.value (pid::tbMethod);
+        for (auto* id : { pid::tbLc, pid::tbE1f, pid::tbE1g, pid::tbE1q, pid::tbE2f, pid::tbE2g, pid::tbE2q }) sig << "_" << ph.value (id);
+        sig << "_" << ph.proc.getSampleRateOrDefault();
+        if (sig != scSig) { scSig = sig; scopeRebuild(); return; }
+        if (scPaused) return;
+        const auto w = ph.proc.scopeRawW.load (std::memory_order_acquire);
+        if (w < sRead || w - sRead > (juce::uint64) (EQAnatomyProcessor::scopeRawN / 2)) { scopeRebuild(); return; }
+        for (auto p = sRead; p < w; ++p) scopeFeed (rawAt (p));
+        sRead = w;
+    }
+    void setPaused (bool p)
+    {
+        if (p == scPaused) return;
+        if (p)
+        {
+            const juce::uint64 end = ph.proc.scopeRawW.load (std::memory_order_acquire);
+            const juce::uint64 keep = std::min ((juce::uint64) (ph.proc.getSampleRateOrDefault() * 8.4), (juce::uint64) (EQAnatomyProcessor::scopeRawN - 16384));
+            const juce::uint64 first = std::max (scEnableW, end > keep ? end - keep : (juce::uint64) 0);
+            frozen.resize ((size_t) (end - first));
+            for (auto q = first; q < end; ++q) frozen[(size_t) (q - first)] = ph.proc.scopeRaw[(size_t) (q & (juce::uint64) (EQAnatomyProcessor::scopeRawN - 1))];
+            frozenEnd = end;
+        }
+        scPaused = p;
+        scPause.setButtonText (p ? juce::String::fromUTF8 ("\xe2\x96\xb6 Play") : juce::String::fromUTF8 ("\xe2\x9d\x9a\xe2\x9d\x9a Pause"));
+        scPause.setToggleState (p, juce::dontSendNotification);
+        scopeRebuild();
+    }
+    void paintScope (juce::Graphics& g) const
+    {
+        if (ph.proc.earActive()) return;
+        const auto a = scopeArea(), wv = scopeWave(), dt = scopeDet();
+        g.setColour (theme::well.withAlpha (lastSplit ? 0.55f : 0.82f)); g.fillRect (a);
+        g.setColour (theme::line); g.drawHorizontalLine ((int) a.getY(), a.getX(), a.getRight());
+        g.setFont (theme::ui (10.0f, true)); g.setColour (theme::muted);
+        g.drawText ("T/B SCOPE  input", (int) a.getX() + 6, (int) a.getY() + 2, 140, 14, juce::Justification::centredLeft);
+        g.setColour (ph.proc.detEq.active() ? theme::accent : theme::muted);
+        g.drawText ("DETECTOR", (int) a.getX() + 6, (int) a.getY() + 33, 54, 12, juce::Justification::centredLeft);
+        g.setFont (theme::ui (8.5f)); g.setColour (theme::muted);
+        g.drawText ("not in output", (int) a.getX() + 6, (int) a.getY() + 45, 54, 12, juce::Justification::centredLeft);
+        // legend
+        int lx = (int) a.getX() + 150 + 3 * 74 + 66 + 62 + 10;
+        for (int k = 0; k < 2; ++k)
+        {
+            g.setColour (k == 0 ? colT() : colB()); g.fillRoundedRectangle ((float) lx, a.getY() + 10, 9, 9, 2);
+            g.setFont (theme::ui (10.0f, true)); g.drawText (k == 0 ? "Transient" : "Body", lx + 12, (int) a.getY() + 6, 60, 16, juce::Justification::centredLeft);
+            lx += 74;
+        }
+        // waveform: dB level per column, attack share from the centre out, body beyond; the lower half mirrors it dimmer
+        const int N = scCols;
+        const float cy = wv.getCentreY(), H = wv.getHeight() * 0.5f, cw = wv.getWidth() / (float) N;
+        for (int k = 0; k < N; ++k)
+        {
+            const int idx = (cW + k) % N;
+            const float pk = cPk[(size_t) idx], t = juce::jlimit (0.0f, 1.0f, cT[(size_t) idx]);
+            const float lv = juce::jlimit (0.0f, 1.0f, (juce::Decibels::gainToDecibels (pk, -60.0f) + 60.0f) / 60.0f);
+            if (lv <= 0.0f) continue;
+            const float x = wv.getX() + k * cw, ht = H * lv * t, hb = H * lv * (1.0f - t), w = std::max (1.0f, cw);
+            g.setColour (colT()); g.fillRect (x, cy - ht, w, ht);
+            g.setColour (colB()); g.fillRect (x, cy - ht - hb, w, hb);
+            g.setColour (colT().withAlpha (0.4f)); g.fillRect (x, cy, w, ht);
+            g.setColour (colB().withAlpha (0.4f)); g.fillRect (x, cy + ht, w, hb);
+        }
+        g.setColour (theme::zero); g.drawHorizontalLine ((int) cy, wv.getX(), wv.getRight());
+        // detector strip: the Sens / Width band, then the detector's peak per column
+        const float s = ph.value (pid::tbSens), wd = ph.value (pid::tbWidth);
+        const float y0 = yDet (-s), y1 = yDet (wd - s);
+        g.setColour (juce::Colour (0xffffd98a).withAlpha (0.16f)); g.fillRect (dt.getX(), y1, dt.getWidth(), y0 - y1);
+        g.setColour (colB()); g.drawLine (dt.getX(), y0, dt.getRight(), y0, scDrag == 1 ? 2.2f : 1.4f);
+        g.setColour (colT()); g.drawLine (dt.getX(), y1, dt.getRight(), y1, scDrag == 2 ? 2.2f : 1.4f);
+        g.setColour (colB()); g.fillRoundedRectangle (dt.getRight() - 18, y0 - 4, 16, 8, 3);
+        g.setColour (colT()); g.fillRoundedRectangle (dt.getRight() - 18, y1 - 4, 16, 8, 3);
+        juce::Path d;
+        for (int k = 0; k < N; ++k)
+        {
+            const int idx = (cW + k) % N;
+            const float y = yDet (cD[(size_t) idx]), x = dt.getX() + k * cw;
+            if (k == 0) d.startNewSubPath (x, y); else d.lineTo (x, y);
+        }
+        g.setColour (theme::text.withAlpha (0.8f)); g.strokePath (d, juce::PathStrokeType (1.1f));
+        g.setColour (theme::muted); g.setFont (theme::ui (9.0f));
+        if (scPaused)
+        {
+            g.setColour (theme::accent); g.setFont (theme::ui (11.0f, true));
+            g.drawText ("PAUSED", (int) wv.getRight() - 70, (int) wv.getY() + 2, 64, 14, juce::Justification::centredRight);
+        }
+        g.setColour (theme::muted); g.setFont (theme::ui (9.0f));
+        g.drawText (juce::String::fromUTF8 ("detector dB  (mask 0 \xe2\x86\x92 1 in the yellow band)"), (int) dt.getX() + 4, (int) dt.getY() - 2, 260, 12, juce::Justification::centredLeft);
+    }
+    float labelRow() const { return lastSplit ? plot().getBottom() + 3 : fullPlot().getBottom() + 2; }
+    juce::String bandTag (int i, const eqcore::Band& b) const
+    {
+        juce::StringArray t;
+        if (ph.proc.bandIsLin (i)) t.add ("Lin");
+        if (b.ch == 1) t.add ("M"); else if (b.ch == 2) t.add ("S");
+        if (ph.value (pid::band (i, "dyn")) > 0.5f) t.add ("D");
+        if (std::abs (ph.value (pid::band (i, "tb"))) > 0.5f) t.add ("T/B");
+        return t.joinIntoString (juce::String::fromUTF8 (" \xc2\xb7 "));
+    }
+    float xOf (double f) const { const auto p = plot(); return p.getX() + (float) (std::log (f / 20.0) / std::log (1000.0)) * p.getWidth(); }
+    double fOf (float x) const { const auto p = plot(); return juce::jlimit (20.0, 20000.0, 20.0 * std::pow (1000.0, (x - p.getX()) / p.getWidth())); }
+    float yOf (double db) const { const auto p = plot(); return juce::jmap ((float) db, -20.0f, 20.0f, p.getBottom(), p.getY()); }
+    juce::Point<float> nodePos (int i, const eqcore::Band& b) const
+    {
+        const bool noGain = b.type == eqcore::Type::LowCut || b.type == eqcore::Type::HighCut || b.type == eqcore::Type::Notch || b.type == eqcore::Type::AllPass;
+        return { xOf (b.f), yOf (noGain ? 0.0 : juce::jlimit (-18.0, 18.0, b.g)) };
+        juce::ignoreUnused (i);
+    }
+    std::optional<std::pair<juce::Point<float>, juce::Point<float>>> handles (int s) const
+    {
+        const auto bands = ph.proc.currentBands(); const auto& b = bands[(size_t) s];
+        if (! b.on || ! (b.type == eqcore::Type::Bell || b.type == eqcore::Type::Notch)) return std::nullopt;
+        const double q = eqcore::effectiveQ (b, ph.proc.currentQMode());
+        const double oct = 2.0 / std::log (2.0) * std::asinh (1.0 / (2.0 * q));
+        const float y = yOf (b.type == eqcore::Type::Notch ? -6.0 : juce::jlimit (-18.0, 18.0, b.g / 2.0));
+        return std::make_pair (juce::Point<float> (xOf (std::max (20.0, b.f * std::pow (2.0, -oct / 2))), y),
+                               juce::Point<float> (xOf (std::min (20000.0, b.f * std::pow (2.0, oct / 2))), y));
+    }
+    Pick pick (juce::Point<float> p) const
+    {
+        if (ph.value (pid::satOn) > 0.5f && p.y > plot().getY() - 2 && p.y < plot().getY() + 20)
+        {
+            if (std::abs (p.x - xOf (ph.value (pid::satLo))) < 10) return { -1, 3 };
+            if (std::abs (p.x - xOf (ph.value (pid::satHi))) < 10) return { -1, 4 };
+        }
+        if (auto h = handles (ph.selected()); h.has_value())
+        {
+            if (std::abs (h->first.x - p.x) < 9 && std::abs (h->first.y - p.y) < 14) return { ph.selected(), 1 };
+            if (std::abs (h->second.x - p.x) < 9 && std::abs (h->second.y - p.y) < 14) return { ph.selected(), 2 };
+        }
+        const auto bands = ph.proc.currentBands(); int best = -1; float bd = 16.0f;
+        for (int i = 0; i < 6; ++i) { const float d = nodePos (i, bands[(size_t) i]).getDistanceFrom (p); if (d < bd) { bd = d; best = i; } }
+        return { best, 0 };
+    }
+    void placePopup()
+    {
+        const int s = ph.selected();
+        const auto bands = ph.proc.currentBands();
+        const auto c = nodePos (s, bands[(size_t) s]);
+        const int w = 316, h = popup.idealHeight();
+        int x = (int) c.x + 22, y = (int) c.y - h - 14;
+        if (x + w > getWidth() - 8) x = (int) c.x - w - 22;
+        if (y < 32) y = (int) c.y + 22;
+        if (y + h > getHeight() - 20) y = getHeight() - 20 - h;
+        popup.setBounds (juce::jlimit (8, getWidth() - w - 8, x), y, w, h);
+    }
+
+    ParamHelp& ph;
+    BandPopup popup;
+    juce::TextButton phaseBtn, gdBtn, overlayBtn, splitBtn;
+    std::vector<double> fr; eqcore::CurvesV2 cur, curS; eqcore::Curves ghost; std::vector<double> selCurve, liveMag;
+    bool anyMS = false, lastSplit = false, altSolo = false;
+    std::vector<float> spectrum, spectrumB; juce::String lastSig;
+    juce::ComboBox anaA, anaB;
+    juce::TextButton scopeBtn; DragValue scSens, scWidth, scAtt;
+    juce::ComboBox scSpan; juce::TextButton scPause;
+    DragValue scLc, scE1f, scE1g, scE1q, scE2f, scE2g, scE2q; Seg scMethod;
+    DetectorEQ sdeq;
+    static constexpr int scCols = 1024;
+    std::array<float, scCols> cPk {}, cT {}, cD {}; int cW = 0;            // scope columns, oldest at cW
+    TransientDetector sdet; juce::uint64 sRead = 0, scEnableW = 0, frozenEnd = 0;
+    double sAcc = 0, sAccT = 0, sPk = 0, sDmax = -100; int sCnt = 0;
+    bool scPaused = false; std::vector<float> frozen; juce::String scSig;
+    bool lastScope = false, autoAna = false; int srcA = 0, srcB = -1, scDrag = 0; float scStartY = 0, scStartSens = 0, scStartWidth = 6;
+    Pick drag; double startQ = 1; float startY = 0, startF = 1000, startG = 0; juce::Point<float> downPos; int axis = 0; juce::uint32 lastRightClick = 0;
+};
+
+// =============================================================================
+//  Band chips (2 × 3): ● toggles a band, the rest selects it
+// =============================================================================
+class BandChips : public juce::Component
+{
+public:
+    explicit BandChips (ParamHelp& h) : ph (h)
+    {
+        setHelp (*this, "BANDS", "クリック：選択して浮き窓を表示（選択中なら表示の切り替え）／ダブルクリック・色の丸：オン・オフ／周波数やゲインの数字：上下ドラッグで変更（Shift で微調整）。右端の印は L＝Lin、M・S＝チャンネル、D＝ダイナミック。キー 1〜6 でも選べる",
+                 "Click: select and show the panel (on the selected band: show/hide) / double-click or the dot: on/off / drag the frequency or gain number up/down to change it (Shift for fine). Tags: L = Lin, M/S = channel, D = dynamic. Keys 1–6 select too");
+    }
+    void paint (juce::Graphics& g) override
+    {
+        const int s = ph.selected();
+        for (int i = 0; i < 6; ++i)
+        {
+            auto r = cell (i).toFloat();
+            const bool on = ph.value (pid::band (i, "on")) > 0.5f;
+            g.setColour (theme::panel); g.fillRoundedRectangle (r, 5.0f);
+            g.setColour (i == s ? theme::bandColour (i) : theme::line); g.drawRoundedRectangle (r.reduced (0.5f), 5.0f, i == s ? 1.5f : 1.0f);
+            auto dot = juce::Rectangle<float> (r.getX() + 8, r.getCentreY() - 5, 10, 10);
+            g.setColour (theme::bandColour (i));
+            if (on) g.fillEllipse (dot); else g.drawEllipse (dot, 1.5f);
+            g.setColour (on ? theme::text : theme::muted); g.setFont (theme::mono (11.0f, true));
+            g.drawText (juce::String (i + 1), (int) r.getX() + 22, (int) r.getY(), 12, (int) r.getHeight(), juce::Justification::centredLeft);
+            const int t = (int) ph.value (pid::band (i, "type"));
+            juce::String txt = juce::String (typeAbbr (t)) + " " + fmtHz (ph.value (pid::band (i, "freq")));
+            if (t <= 2) txt << " " << fmtDb (ph.value (pid::band (i, "gain")));
+            juce::String tag;
+            if (on)
+            {
+                if (ph.proc.bandIsLin (i)) tag << "L";
+                const int ch = (int) ph.value (pid::band (i, "ch")); if (ch == 1) tag << "M"; else if (ch == 2) tag << "S";
+                if (ph.value (pid::band (i, "dyn")) > 0.5f) tag << "D";
+            }
+            g.setFont (theme::mono (10.0f)); g.setColour (on ? theme::text : theme::muted);
+            g.drawText (on ? txt : juce::String ("off  ") + fmtHz (ph.value (pid::band (i, "freq"))),
+                        (int) r.getX() + 36, (int) r.getY(), (int) r.getWidth() - 40 - tag.length() * 6, (int) r.getHeight(), juce::Justification::centredLeft, true);
+            if (tag.isNotEmpty())
+            {
+                g.setColour (theme::bandColour (i)); g.setFont (theme::mono (8.5f, true));
+                g.drawText (tag, (int) r.getRight() - 30, (int) r.getY(), 26, (int) r.getHeight(), juce::Justification::centredRight);
+            }
+        }
+    }
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        dragBand = -1;
+        for (int i = 0; i < 6; ++i)
+            if (cell (i).contains (e.getPosition()))
+            {
+                ph.proc.undo.beginNewTransaction();
+                if (e.x < cell (i).getX() + 22) { toggleOn (i); ph.select (i); repaint(); return; }
+                if (e.getNumberOfClicks() >= 2) return;            // the double-click handles it
+                // on the frequency or gain number: a click still selects (on mouse-up), a drag changes the value
+                const int k = e.mods.isPopupMenu() ? 0 : zoneAt (i, e.x);
+                if (k > 0) { dragBand = i; dragKind = k; dragged = false; lastY = e.getScreenPosition().toFloat().y; return; }
+                clickCell (i); return;
+            }
+    }
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        if (dragBand < 0) return;
+        auto* p = ph.get (pid::band (dragBand, dragKind == 1 ? "freq" : "gain")); if (p == nullptr) return;
+        if (! dragged)
+        {
+            if (e.getDistanceFromDragStart() < 3) return;
+            dragged = true; p->beginChangeGesture(); startNorm = p->getValue(); ph.select (dragBand);
+            setMouseCursor (juce::MouseCursor::UpDownResizeCursor);
+        }
+        // like DragValue: screen coordinates, 200 px = full range, Shift = fine
+        const float y = e.getScreenPosition().toFloat().y, sens = e.mods.isShiftDown() ? 0.0008f : 0.005f;
+        startNorm = juce::jlimit (0.0f, 1.0f, startNorm + (lastY - y) * sens); lastY = y;
+        p->setValueNotifyingHost (startNorm); repaint();
+    }
+    void mouseUp (const juce::MouseEvent&) override
+    {
+        if (dragBand < 0) return;
+        const int i = dragBand; dragBand = -1;
+        if (dragged)
+        {
+            if (auto* p = ph.get (pid::band (i, dragKind == 1 ? "freq" : "gain"))) p->endChangeGesture();
+            dragged = false; setMouseCursor (juce::MouseCursor::NormalCursor); repaint();
+        }
+        else clickCell (i);                                         // no drag: it was a click on the card
+    }
+    void mouseMove (const juce::MouseEvent& e) override
+    {
+        int k = 0;
+        for (int i = 0; i < 6 && k == 0; ++i) if (cell (i).contains (e.getPosition()) && e.x >= cell (i).getX() + 22) k = zoneAt (i, e.x);
+        setMouseCursor (k > 0 ? juce::MouseCursor::UpDownResizeCursor : juce::MouseCursor::NormalCursor);
+    }
+    void mouseDoubleClick (const juce::MouseEvent& e) override
+    {
+        for (int i = 0; i < 6; ++i)
+            if (cell (i).contains (e.getPosition()) && e.x >= cell (i).getX() + 22)
+            {
+                auto& ui = ph.proc.uiState;
+                if (toggledPopup) ui.setProperty ("popup", ! (bool) ui.getProperty ("popup", true), nullptr);   // undo the first click's toggle
+                toggledPopup = false;
+                toggleOn (i); repaint(); return;
+            }
+    }
+private:
+    void clickCell (int i)
+    {
+        auto& ui = ph.proc.uiState;
+        toggledPopup = false;
+        if (ph.selected() != i) { ph.select (i); ui.setProperty ("popup", true, nullptr); }
+        else { ui.setProperty ("popup", ! (bool) ui.getProperty ("popup", true), nullptr); toggledPopup = true; }
+        if (ph.value (pid::band (i, "on")) < 0.5f) ui.setProperty ("keepOff", i, nullptr);   // show the panel for an off band too
+        repaint();
+    }
+    static const char* typeAbbr (int t) { static const char* ab[] = { "Bell", "LS", "HS", "LC", "HC", "Notch", "AP" }; return ab[juce::jlimit (0, 6, t)]; }
+    // which number of card i is under x: 1 = frequency, 2 = gain, 0 = none (measured from the same text that paint() draws)
+    int zoneAt (int i, int x) const
+    {
+        const auto r = cell (i);
+        const bool on = ph.value (pid::band (i, "on")) > 0.5f;
+        const int t = (int) ph.value (pid::band (i, "type"));
+        const juce::Font f = theme::mono (10.0f);
+        const juce::String prefix = on ? juce::String (typeAbbr (t)) + " " : juce::String ("off  "), fs = fmtHz (ph.value (pid::band (i, "freq")));
+        const float fx0 = (float) r.getX() + 36.0f + juce::GlyphArrangement::getStringWidth (f, prefix), fx1 = fx0 + juce::GlyphArrangement::getStringWidth (f, fs);
+        if ((float) x >= fx0 - 2.0f && (float) x <= fx1 + 2.0f) return 1;
+        if (on && t <= 2)
+        {
+            const float gx0 = fx1 + juce::GlyphArrangement::getStringWidth (f, " "), gx1 = gx0 + juce::GlyphArrangement::getStringWidth (f, fmtDb (ph.value (pid::band (i, "gain"))));
+            if ((float) x >= gx0 - 2.0f && (float) x <= gx1 + 2.0f) return 2;
+        }
+        return 0;
+    }
+    void toggleOn (int i)
+    {
+        const bool on = ph.value (pid::band (i, "on")) > 0.5f;
+        if (on) ph.proc.uiState.setProperty ("keepOff", i, nullptr);
+        ph.setGesture (pid::band (i, "on"), on ? 0.0f : 1.0f);
+    }
+    juce::Rectangle<int> cell (int i) const
+    {
+        const int cw = (getWidth() - 5) / 2, ch = (getHeight() - 10) / 3;
+        return { (i % 2) * (cw + 5), (i / 2) * (ch + 5), cw, ch };
+    }
+    ParamHelp& ph; bool toggledPopup = false;
+    int dragBand = -1, dragKind = 0; bool dragged = false; float startNorm = 0, lastY = 0;
+};
+
+// =============================================================================
+//  Impulse response (dB envelope, ±40 ms around the main tap)
+// =============================================================================
+class IRView : public juce::Component
+{
+public:
+    explicit IRView (ParamHelp& h) : ph (h) { setHelp (*this, "IMPULSE", "インパルスレスポンス（±40 ms）。0 ms より左の赤い部分がプリリンギング＝音より前に出る成分", "Impulse response (±40 ms). Red, left of 0 ms, is pre-ringing: output before the sound"); }
+    void refresh()
+    {
+        if (ph.proc.displayVersion() == version) return;
+        ph.proc.copyDisplayIR (ir); version = ir.version; repaint();
+    }
+    void paint (juce::Graphics& g) override
+    {
+        auto r = getLocalBounds().toFloat();
+        g.setColour (theme::panel); g.fillRoundedRectangle (r, 6.0f);
+        g.setColour (theme::line); g.drawRoundedRectangle (r.reduced (0.5f), 6.0f, 1.0f);
+        g.setFont (theme::ui (9.5f)); g.setColour (theme::muted);
+        g.drawText (juce::String ("IMPULSE"), 8, 4, 80, 14, juce::Justification::centredLeft);
+        g.setColour (theme::pre);
+        g.drawText (ir.preDb > -200 ? "PRE " + juce::String ((int) std::round (ir.preMs)) + " ms" : juce::String ("PRE none"),
+                    getWidth() - 98, 4, 90, 14, juce::Justification::centredRight);
+        auto w = r.reduced (8).withTrimmedTop (16).withTrimmedBottom (12);
+        g.setColour (theme::well); g.fillRoundedRectangle (w, 4.0f);
+        g.setColour (theme::pre.withAlpha (0.12f)); g.fillRect (w.withWidth (w.getWidth() / 2));
+        g.setFont (theme::mono (9.0f)); g.setColour (theme::muted);
+        g.drawText (juce::String::fromUTF8 ("\xe2\x88\x92") + "40", (int) w.getX(), (int) w.getBottom(), 40, 12, juce::Justification::centredLeft);
+        g.drawText ("0 ms", (int) w.getCentreX() - 20, (int) w.getBottom(), 40, 12, juce::Justification::centred);
+        g.drawText ("+40", (int) w.getRight() - 40, (int) w.getBottom(), 40, 12, juce::Justification::centredRight);
+        if (ir.h.empty()) return;
+        float pk = 1e-9f; for (auto v : ir.h) pk = std::max (pk, std::abs (v));
+        const int span = (int) (0.04 * ir.fs), cols = (int) w.getWidth();
+        juce::Path pre, post; bool fp = true, fq = true;
+        for (int x = 0; x < cols; ++x)
+        {
+            const int a = ir.latency - span + (int) ((double) x / cols * 2 * span), b = ir.latency - span + (int) ((double) (x + 1) / cols * 2 * span);
+            float m = 0; for (int i = a; i < std::max (a + 1, b); ++i) if (i >= 0 && i < (int) ir.h.size()) m = std::max (m, std::abs (ir.h[(size_t) i]));
+            const float db = juce::jmax (-100.0f, 20.0f * std::log10 (m / pk + 1e-12f));
+            const float y = juce::jmap (db, -100.0f, 0.0f, w.getBottom() - 1, w.getY() + 2), px = w.getX() + (float) x;
+            auto& p = a < ir.latency - 12 ? pre : post; bool& f = a < ir.latency - 12 ? fp : fq;
+            if (f) { p.startNewSubPath (px, y); f = false; } else p.lineTo (px, y);
+        }
+        g.setColour (theme::pre); g.strokePath (pre, juce::PathStrokeType (1.3f));
+        g.setColour (theme::accent); g.strokePath (post, juce::PathStrokeType (1.3f));
+    }
+private:
+    ParamHelp& ph; DisplayIR ir; int version = -1;
+};
+
+// =============================================================================
+//  OUT: drag up / down, double-click resets
+// =============================================================================
+class OutputDrag : public juce::Component
+{
+public:
+    explicit OutputDrag (ParamHelp& h) : ph (h) { markReset (*this); setHelp (*this, "OUT", "出力ゲイン。上下ドラッグ（Shift で微調整）、ダブルクリックで 0 dB", "Output gain. Drag up/down (Shift for fine), double-click for 0 dB"); }
+    void paint (juce::Graphics& g) override
+    {
+        auto r = getLocalBounds().toFloat();
+        g.setColour (theme::panel); g.fillRoundedRectangle (r, 4.0f);
+        g.setColour (theme::line); g.drawRoundedRectangle (r.reduced (0.5f), 4.0f, 1.0f);
+        g.setColour (theme::muted); g.setFont (theme::ui (9.5f)); g.drawText ("OUT", 8, 0, 40, getHeight(), juce::Justification::centredLeft);
+        g.setColour (theme::text); g.setFont (theme::mono (11.0f, true));
+        g.drawText (fmtDb (ph.value (pid::output)), 0, 0, getWidth() - 8, getHeight(), juce::Justification::centredRight);
+    }
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        resetDone = e.mods.isAltDown();
+        if (resetDone) { ph.resetDefault (pid::output); repaint(); return; }
+        start = ph.value (pid::output); ph.begin (pid::output);
+    }
+    void mouseDrag (const juce::MouseEvent& e) override { if (resetDone) return; ph.set (pid::output, juce::jlimit (-18.0f, 18.0f, start - e.getDistanceFromDragStartY() * (e.mods.isShiftDown() ? 0.02f : 0.1f))); repaint(); }
+    void mouseUp (const juce::MouseEvent&) override { if (resetDone) { resetDone = false; return; } ph.end (pid::output); }
+    void mouseDoubleClick (const juce::MouseEvent&) override { ph.setGesture (pid::output, 0.0f); repaint(); }
+private:
+    ParamHelp& ph; float start = 0; bool resetDone = false;
+};
+
+// =============================================================================
+//  SOLO M | S | T | B: listen to one part of the finished output. Not a parameter and never saved.
+//  Click selects, click again clears. Dimmed while EAR / Bypass / Delta / Pre-ring solo / band solo take priority.
+// =============================================================================
+class SoloView : public juce::Component
+{
+public:
+    explicit SoloView (ParamHelp& h) : ph (h)
+    {
+        setHelp (*this, "SOLO  M | S | T | B",
+                 "出力のどの部分だけを聴くか。M＝Mid（中央の音。左右同じ）／S＝Side（左右に広がる成分。左右が逆相なので、モノラルにすると消える）／T＝検出器がアタックと見る部分（出力×マスク）／B＝胴と見る部分（出力×(1−マスク)）。もう一度押すと解除。切り替えは約 15 ms のクロスフェード。優先順位：EAR ＞ Bypass ＞ Delta ＞ Pre-ring solo ＞ バンドソロ ＞ この SOLO（上位がオンの間は働かず、灰色になる）。保存されない（開き直すとオフ）。スペアナはこの SOLO の影響を受けない。注意：T／B は検出器の見立てで、厳密な分離ではない。T と B を足しても元の音になるのは各瞬間のマスクが 0〜1 のときだけで、聞こえ方は目安",
+                 "Which part of the finished output you hear. M = Mid (the centre, identical in both ears) / S = Side (the widening part: left and right are opposite in polarity, so it vanishes in mono) / T = what the detector hears as attack (output × mask) / B = as body (output × (1 − mask)). Click again to clear. Switching cross-fades over about 15 ms. Priority: EAR > Bypass > Delta > Pre-ring solo > band solo > this SOLO (it is ignored and dimmed while any of those is on). Not saved: off after reopening. The analyzer is not affected by it. Careful: T and B are the detector's guess, not a strict separation");
+    }
+    void paint (juce::Graphics& g) override
+    {
+        auto r = getLocalBounds().toFloat();
+        g.setColour (theme::panel); g.fillRoundedRectangle (r, 4.0f);
+        g.setColour (theme::line); g.drawRoundedRectangle (r.reduced (0.5f), 4.0f, 1.0f);
+        const int sel = ph.proc.soloView.load();
+        const bool blocked = ph.proc.soloViewBlocked();
+        g.setColour (blocked ? theme::faint : theme::muted); g.setFont (theme::ui (9.5f));
+        g.drawText ("SOLO", 8, 0, labelW - 8, getHeight(), juce::Justification::centredLeft);
+        static const char* t[] = { "M", "S", "T", "B" };
+        const float w = cellW();
+        for (int i = 0; i < 4; ++i)
+        {
+            auto c = juce::Rectangle<float> (r.getX() + labelW + (float) i * w, r.getY() + 3.0f, w, r.getHeight() - 6.0f).reduced (1.5f, 0.0f);
+            const bool on = sel == i + 1;
+            if (on) { g.setColour (theme::accent.withAlpha (blocked ? 0.3f : 1.0f)); g.fillRoundedRectangle (c, 3.0f); }
+            g.setColour (on ? theme::onAccent : (blocked ? theme::faint : theme::muted)); g.setFont (theme::mono (11.0f, true));
+            g.drawText (t[i], c, juce::Justification::centred);
+        }
+    }
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        const int i = (int) std::floor (((float) e.x - labelW) / cellW());
+        if (i < 0 || i > 3 || e.mods.isPopupMenu()) return;
+        ph.proc.soloView = ph.proc.soloView.load() == i + 1 ? 0 : i + 1;
+        repaint();
+    }
+private:
+    static constexpr float labelW = 38.0f;
+    float cellW() const { return ((float) getWidth() - labelW - 3.0f) / 4.0f; }
+    ParamHelp& ph;
+};
+
+// =============================================================================
+//  Lesson card (Learn on) / mode notes (Learn off)
+// =============================================================================
+class LessonCard : public juce::Component
+{
+public:
+    explicit LessonCard (ParamHelp& h) : ph (h)
+    {
+        for (auto* b : { &prev, &load, &next }) addAndMakeVisible (*b);
+        load.setColour (juce::TextButton::buttonColourId, theme::accent);
+        load.setColour (juce::TextButton::textColourOffId, theme::onAccent);
+        prev.onClick = [this] { step (-1); };
+        next.onClick = [this] { step (1); };
+        load.onClick = [this] { ph.proc.applyLesson (index()); };
+    }
+    int index() const { return juce::jlimit (0, (int) lessons().size() - 1, (int) ph.proc.uiState.getProperty ("lesson", 0)); }
+    void step (int d) { ph.proc.uiState.setProperty ("lesson", juce::jlimit (0, (int) lessons().size() - 1, index() + d), nullptr); repaint(); }
+    void refreshTexts()
+    {
+        prev.setButtonText (ph.tr ("前へ", "Back")); next.setButtonText (ph.tr ("次へ", "Next"));
+        load.setButtonText (ph.tr ("この設定を読み込む", "Load this setting"));
+        const bool learn = (bool) ph.proc.uiState.getProperty ("learn", true);
+        for (auto* b : { &prev, &load, &next }) b->setVisible (learn);
+    }
+    void resized() override
+    {
+        const int y = getHeight() - 30;
+        next.setBounds (getWidth() - 62, y, 52, 22);
+        prev.setBounds (getWidth() - 118, y, 52, 22);
+        load.setBounds (getWidth() - 262, y, 140, 22);
+    }
+    void paint (juce::Graphics& g) override
+    {
+        auto r = getLocalBounds().toFloat();
+        const bool learn = (bool) ph.proc.uiState.getProperty ("learn", true);
+        g.setColour (learn ? theme::lessonBg : theme::panel); g.fillRoundedRectangle (r, 6.0f);
+        g.setColour (learn ? theme::lessonLn : theme::line); g.drawRoundedRectangle (r.reduced (0.5f), 6.0f, 1.0f);
+        auto a = getLocalBounds().reduced (12, 8);
+        if (! learn) { paintInfo (g, a); return; }
+        const auto& L = lessons(); const int i = index(); const auto& ls = L[(size_t) i];
+        g.setFont (theme::mono (10.0f, true)); g.setColour (theme::accent);
+        const juce::String head = "LESSON " + juce::String (i + 1).paddedLeft ('0', 2) + " / " + juce::String ((int) L.size());
+        g.drawText (head, a.getX(), a.getY(), 120, 14, juce::Justification::centredLeft);
+        auto bar = juce::Rectangle<float> ((float) a.getX() + 124, (float) a.getY() + 6, (float) a.getWidth() - 124, 3.0f);
+        g.setColour (theme::lessonLn.withAlpha (0.45f)); g.fillRoundedRectangle (bar, 1.5f);
+        g.setColour (theme::accent); g.fillRoundedRectangle (bar.withWidth (bar.getWidth() * (i + 1) / (float) L.size()), 1.5f);
+        g.setColour (theme::text); g.setFont (theme::ui (14.0f, true));
+        g.drawText (juce::String::fromUTF8 (ph.ja() ? ls.titleJa : ls.titleEn), a.getX(), a.getY() + 18, a.getWidth(), 20, juce::Justification::centredLeft);
+        const auto& steps = ph.ja() ? ls.stepsJa : ls.stepsEn;
+        g.setFont (theme::ui (11.0f)); g.setColour (theme::text.withAlpha (0.82f));
+        int y = a.getY() + 42;
+        for (size_t k = 0; k < steps.size(); ++k)
+        {
+            g.drawFittedText (juce::String ((int) k + 1) + ".  " + juce::String::fromUTF8 (steps[k]), a.getX(), y, a.getWidth(), 16, juce::Justification::centredLeft, 1, 0.85f);
+            y += 17;
+        }
+        g.setColour (theme::muted); g.setFont (theme::ui (10.0f));
+        g.drawFittedText (ph.tr ("なぜ？ ", "Why? ") + juce::String::fromUTF8 (ph.ja() ? ls.whyJa : ls.whyEn),
+                          a.getX(), getHeight() - 30, getWidth() - 290, 22, juce::Justification::centredLeft, 2, 0.85f);
+    }
+private:
+    // Hover help: one line per item ("Key：text" items separated by ／ or " / "), the "Careful" part on its own line in red,
+    // the Option+click hint muted, and the largest font (16 → 10 px) that fits the card without cutting anything.
+    // the "Key" of a list item: where "Key：", "Key＝", "Key: " or "Key = " ends (0 = none). Keys are short.
+    // the "Key" of a list item: where "Key：", "Key＝", "Key: " or "Key = " ends (0 = none). Keys are short and have no sentence mark.
+    // (character based: String::indexOf with full-width text is not reliable here)
+    static int keyEnd (const juce::String& s)
+    {
+        const int n = juce::jmin (s.length() - 1, 16);
+        for (int i = 1; i < n; ++i)
+        {
+            const auto c = s[i];
+            if (c == 0x3002 || c == 0x3001 || c == '.' || c == ',') return 0;
+            if (c == 0xff1a || c == 0xff1d) return i + 1;
+            if (c == ':' && s[i + 1] == ' ') return i + 2;
+            if (c == ' ' && s[i + 1] == '=' && i + 2 < s.length() && s[i + 2] == ' ') return i + 3;
+        }
+        return 0;
+    }
+    // end of a sentence: "。" (ja) or ". " before a capital (en); returns the index just after it, or -1
+    static int sentenceEnd (const juce::String& t, int from, bool ja, bool last)
+    {
+        int found = -1, depth = 0;            // a mark inside brackets does not end the sentence
+        for (int i = juce::jmax (0, from); i < t.length(); ++i)
+        {
+            if (t[i] == '(' || t[i] == 0xff08) { ++depth; continue; }
+            if (t[i] == ')' || t[i] == 0xff09) { depth = juce::jmax (0, depth - 1); continue; }
+            if (depth > 0) continue;
+            const bool hit = ja ? t[i] == 0x3002 : (t[i] == '.' && i + 2 < t.length() && t[i + 1] == ' ' && juce::CharacterFunctions::isUpperCase (t[i + 2]));
+            if (hit) { found = i + 1; if (! last) break; }
+        }
+        return found;
+    }
+    juce::AttributedString helpLayout (const juce::String& raw, float px) const
+    {
+        const bool ja = ph.ja();
+        const juce::String sep = ja ? juce::String::fromUTF8 ("\xef\xbc\x8f") : juce::String (" / ");
+        juce::AttributedString as;
+        as.setWordWrap (ja ? juce::AttributedString::byChar : juce::AttributedString::byWord);
+        as.setLineSpacing (px * 0.18f);
+        const auto fN = theme::ui (px), fS = theme::ui (px - 1.0f);
+        bool firstPara = true;
+        auto para = [&] (const juce::String& txt, juce::Colour c, bool bullet, bool small)
+        {
+            auto t = txt.trim(); if (t.isEmpty()) return;
+            if (! firstPara) as.append ("\n", fN, c);
+            firstPara = false;
+            if (bullet) as.append (juce::String::fromUTF8 (ja ? "\xe3\x83\xbb" : "\xe2\x80\xa2 "), fN, theme::muted);
+            const int k = bullet ? keyEnd (t) : 0;
+            if (k > 0) { as.append (t.substring (0, k), fN, theme::accent); as.append (t.substring (k), fN, c); }   // one font per line: mixing bold breaks the wrap
+            else as.append (t, small ? fS : fN, c);
+        };
+        for (auto line : juce::StringArray::fromLines (raw))
+        {
+            if (line.trim().isEmpty()) continue;
+            if (line.startsWith ("Option")) { para (line, theme::muted, false, true); continue; }
+            juce::String main = line, careful;
+            {
+                int c = line.indexOf ("Careful:");
+                for (int i = 0; c < 0 && i + 2 < line.length(); ++i)
+                    if (line[i] == 0x6ce8 && line[i + 1] == 0x610f && line[i + 2] == 0xff1a) c = i;      // 注意：
+                if (c >= 0) { main = line.substring (0, c); careful = line.substring (c); }
+            }
+            // "lead. A：… ／ B：… ／ C：…. tail" → lead / one item per line / tail
+            juce::StringArray parts;
+            if (ja)
+            {
+                juce::String cur;
+                for (auto p = main.getCharPointer(); ! p.isEmpty();) { const auto ch = p.getAndAdvance(); if (ch == (juce::juce_wchar) 0xff0f) { parts.add (cur); cur.clear(); } else cur += juce::String::charToString (ch); }
+                parts.add (cur);
+            }
+            else for (auto rest = main;;) { const int i = rest.indexOf (sep); if (i < 0) { parts.add (rest); break; } parts.add (rest.substring (0, i)); rest = rest.substring (i + sep.length()); }
+            juce::StringArray items;
+            for (auto& p : parts)
+            {
+                if (items.isEmpty()) { items.add (p); continue; }
+                if (keyEnd (p.trim()) > 0) items.add (p.trim()); else items.set (items.size() - 1, items[items.size() - 1] + sep + p);
+            }
+            int keyed = 0; for (auto& it : items) if (keyEnd (it.trim()) > 0) ++keyed;
+            // the first piece may start with a sentence ("What it listens to. In: …")
+            if (items.size() > 1 && keyEnd (items[0].trim()) == 0)
+            {
+                const int st = sentenceEnd (items[0], 0, ja, false);
+                if (st > 0) { const auto key = items[0].substring (st).trim(); if (keyEnd (key) > 0) { const auto lead = items[0].substring (0, st); items.set (0, key); items.insert (0, "\x01" + lead); ++keyed; } }
+            }
+            if (keyed < 2) { para (main, theme::text, false, false); }
+            else
+            {
+                for (auto& it : items)
+                {
+                    if (it.startsWithChar (1)) { para (it.substring (1), theme::text, false, false); continue; }
+                    const int k = keyEnd (it.trim());
+                    if (k == 0) { para (it, theme::text, false, false); continue; }
+                    // a following sentence that is not about this item goes on its own line
+                    const auto t = it.trim(); const int st = sentenceEnd (t, k, ja, false);
+                    if (st > 0 && t.substring (st).trim().length() > 8)
+                    { para (t.substring (0, st), theme::text, true, false); para (t.substring (st), theme::text, false, false); }
+                    else para (t, theme::text, true, false);
+                }
+            }
+            if (careful.isNotEmpty()) para (careful, theme::pre, false, false);
+        }
+        return as;
+    }
+    void drawHelp (juce::Graphics& g, const juce::String& raw, juce::Rectangle<int> r) const
+    {
+        juce::TextLayout tl;
+        for (float px = 16.0f; px >= 10.0f; px -= 0.5f)
+        {
+            tl.createLayout (helpLayout (raw, px), (float) r.getWidth());
+            if (tl.getHeight() <= (float) r.getHeight()) break;
+        }
+        tl.draw (g, r.toFloat());
+    }
+    void paintInfo (juce::Graphics& g, juce::Rectangle<int> a)
+    {
+        const int m = (int) ph.proc.currentMode();
+        static const char* ja[] = { "ゼロレイテンシー：デジタル IIR。遅れゼロで、音より先に何も出ない。ゲインが変わる帯域で位相が回る。",
+                                    "アナログ一致：アナログ回路と同じ振幅と位相を持つ最小位相 FIR。高域を大きく触っても形が崩れない。",
+                                    "リニア位相：左右対称の FIR。位相は回らないが、全帯域が遅れ、アタックの前にプリリンギングが出る。" };
+        static const char* en[] = { "Zero latency: a digital IIR. No delay and nothing before the sound; the phase turns where the gain changes.",
+                                    "Analog: a minimum-phase FIR with the analog magnitude and phase. High-frequency curves keep their shape.",
+                                    "Linear phase: a symmetric FIR. No phase shift, but everything is delayed and pre-ringing appears before the attack." };
+        auto header = [&] (const juce::String& t, int y, juce::Colour c)
+        { g.setColour (c); g.setFont (theme::mono (10.0f, true)); g.drawText (t, a.getX(), y, a.getWidth(), 14, juce::Justification::centredLeft); };
+        if (ph.hoverTitle.isNotEmpty())
+        {
+            header (ph.hoverTitle, a.getY(), theme::accent);
+            drawHelp (g, ph.hoverText, a.withTrimmedTop (18));
+            return;
+        }
+        if (const int pi = (int) ph.proc.uiState.getProperty ("preset", -1); pi >= 0 && pi < (int) presets().size())
+        {
+            const auto& pr = presets()[(size_t) pi];
+            const bool ja = ph.ja();
+            header ("PRESET  " + juce::String::fromUTF8 (ja ? pr.nameJa : pr.nameEn), a.getY(), theme::accent);
+            g.setColour (theme::text); g.setFont (theme::ui (12.0f));
+            g.drawFittedText (juce::String::fromUTF8 (ja ? pr.purposeJa : pr.purposeEn), a.getX(), a.getY() + 18, a.getWidth(), 36, juce::Justification::topLeft, 2, 0.9f);
+            g.setFont (theme::ui (12.0f, true));
+            g.drawFittedText ((ja ? juce::String::fromUTF8 ("まず：") : juce::String ("First: ")) + juce::String::fromUTF8 (ja ? pr.firstJa : pr.firstEn),
+                              a.getX(), a.getY() + 58, a.getWidth(), 36, juce::Justification::topLeft, 2, 0.9f);
+            g.setColour (theme::pre); g.setFont (theme::ui (11.5f));
+            g.drawFittedText ((ja ? juce::String::fromUTF8 ("注意：") : juce::String ("Careful: ")) + juce::String::fromUTF8 (ja ? pr.cautionJa : pr.cautionEn),
+                              a.getX(), a.getY() + 98, a.getWidth(), a.getHeight() - 98, juce::Justification::topLeft, 3, 0.9f);
+            return;
+        }
+        header ("CURRENT MODE", a.getY(), theme::muted);
+        g.setColour (theme::text); g.setFont (theme::ui (12.0f));
+        g.drawFittedText (juce::String::fromUTF8 (ph.ja() ? ja[m] : en[m]), a.getX(), a.getY() + 18, a.getWidth(), 50, juce::Justification::topLeft, 3, 0.9f);
+        header ("MOUSE", a.getY() + 64, theme::muted);
+        g.setColour (theme::text); g.setFont (theme::ui (12.0f));
+        g.drawFittedText (juce::String::fromUTF8 (ph.ja() ? mouseHelpJa() : mouseHelpEn()), a.getX(), a.getY() + 82, a.getWidth(), a.getHeight() - 82,
+                          juce::Justification::topLeft, 4, 0.9f);
+    }
+    ParamHelp& ph;
+    juce::TextButton prev, load, next;
+};
+
+// =============================================================================
+//  IN · OUT meters (peak with 1.5 s hold, RMS) and output correlation
+// =============================================================================
+class IOMeter : public juce::Component
+{
+public:
+    explicit IOMeter (ParamHelp& h) : ph (h)
+    {
+        setHelp (*this, "IN / OUT", "入出力のピーク（細い線は 1.5 秒ホールド）と RMS（300 ms）。Auto gain の効き具合や、次のプラグインへの送り量の確認に。下の CORR は出力の位相相関：+1 で左右同じ、0 で無相関、マイナスはモノラルで打ち消し合う",
+                 "Input and output peak (thin line: 1.5 s hold) and RMS (300 ms): check Auto gain and what you send to the next plugin. CORR below is output correlation: +1 identical, 0 unrelated, negative cancels in mono");
+    }
+    void tick()
+    {
+        const double dt = 1.0 / 30.0;
+        auto pk = [] (std::atomic<float>& a) { return 20.0 * std::log10 (std::max (1e-6f, a.exchange (0.0f))); };
+        auto rm = [] (std::atomic<float>& a) { return 10.0 * std::log10 (std::max (1e-12f, a.load())); };
+        const double ip = std::max (pk (ph.proc.inPeak[0]), pk (ph.proc.inPeak[1])), op = std::max (pk (ph.proc.outPeak[0]), pk (ph.proc.outPeak[1]));
+        ir = std::max (rm (ph.proc.inRms[0]), rm (ph.proc.inRms[1])); orr = std::max (rm (ph.proc.outRms[0]), rm (ph.proc.outRms[1]));
+        auto ball = [dt] (double in, double& disp, double& hold, double& t)
+        {
+            disp = in >= disp ? in : std::max (in, disp - 20.0 * dt);
+            if (in >= hold) { hold = in; t = 0; } else if ((t += dt) > 1.5) hold = std::max (in, hold - 20.0 * dt);
+        };
+        ball (ip, iDisp, iHold, iT); ball (op, oDisp, oHold, oT);
+        corr += (ph.proc.correlation.load() - corr) * 0.3;
+        repaint();
+    }
+    void paint (juce::Graphics& g) override
+    {
+        auto r = getLocalBounds().toFloat();
+        g.setColour (theme::panel); g.fillRoundedRectangle (r, 6.0f);
+        g.setColour (theme::line); g.drawRoundedRectangle (r.reduced (0.5f), 6.0f, 1.0f);
+        g.setColour (theme::muted); g.setFont (theme::ui (9.0f, true));
+        g.drawText ("IN  OUT", 0, 4, getWidth(), 12, juce::Justification::centred);
+        const float top = 20, bottom = (float) getHeight() - 112;
+        auto yOf = [&] (double db) { return juce::jmap ((float) juce::jlimit (-60.0, 3.0, db), -60.0f, 3.0f, bottom, top); };
+        auto bar = [&] (float x, double disp, double rms, double hold, juce::Colour c)
+        {
+            auto well = juce::Rectangle<float> (x, top, 9, bottom - top);
+            g.setColour (theme::well); g.fillRoundedRectangle (well, 2.0f);
+            g.setColour (c.withAlpha (0.45f)); g.fillRect (well.withTop (yOf (disp)));
+            g.setColour (c); g.fillRect (well.withTop (yOf (rms)));
+            g.setColour (hold > -0.1 ? theme::pre : theme::text); g.fillRect (x - 1, yOf (hold) - 1, 11.0f, 2.0f);
+        };
+        const float cx = r.getCentreX();
+        bar (cx - 12, iDisp, ir, iHold, theme::muted);
+        bar (cx + 3, oDisp, orr, oHold, theme::accent);
+        g.setColour (theme::faint);
+        for (int db : { 0, -12, -24, -36, -48 })                 // 12 dB ticks
+        { g.fillRect (cx - 18, yOf (db), 4.0f, 1.0f); g.fillRect (cx + 14, yOf (db), 4.0f, 1.0f); }
+        auto num = [] (double v) { return v < -99 ? juce::String::fromUTF8 ("\xe2\x80\x94") : fmtDb (v); };
+        float y = bottom + 6;
+        g.setFont (theme::mono (9.0f, true));
+        for (auto row : { std::make_pair ("PK", std::make_pair (iHold, oHold)), std::make_pair ("RMS", std::make_pair (ir, orr)) })
+        {
+            g.setColour (theme::muted); g.drawText (row.first, 0, (int) y, getWidth(), 11, juce::Justification::centred); y += 11;
+            g.setColour (theme::text); g.drawText (num (row.second.first), 0, (int) y, getWidth(), 11, juce::Justification::centred); y += 11;
+            g.setColour (theme::accent); g.drawText (num (row.second.second), 0, (int) y, getWidth(), 11, juce::Justification::centred); y += 13;
+        }
+        g.setColour (theme::muted); g.drawText ("CORR", 0, (int) y, getWidth(), 11, juce::Justification::centred); y += 12;
+        auto cb = juce::Rectangle<float> (6, y, (float) getWidth() - 12, 6);
+        g.setColour (theme::well); g.fillRoundedRectangle (cb, 2.0f);
+        g.setColour (theme::faint); g.fillRect (cb.getCentreX() - 0.5f, cb.getY() - 2, 1.0f, cb.getHeight() + 4);
+        const float px = cb.getX() + cb.getWidth() * (float) ((corr + 1.0) / 2.0);
+        const juce::Colour cc = corr < 0 ? theme::pre : theme::ok;
+        g.setColour (cc); g.fillRoundedRectangle (px - 3, cb.getY() - 1, 6, cb.getHeight() + 2, 2.0f);
+        g.drawText ((corr >= 0 ? "+" : juce::String::fromUTF8 ("\xe2\x88\x92")) + juce::String (std::abs (corr), 2), 0, (int) y + 8, getWidth(), 11, juce::Justification::centred);
+    }
+private:
+    ParamHelp& ph;
+    double iDisp = -100, oDisp = -100, iHold = -100, oHold = -100, iT = 0, oT = 0, ir = -100, orr = -100, corr = 1;
+};
+
+// =============================================================================
+//  Ear training: a hidden bell on the DAW signal, guess the band
+// =============================================================================
+class EarCard : public juce::Component
+{
+public:
+    explicit EarCard (ParamHelp& h) : ph (h)
+    {
+        for (auto* b : { &easyB, &normB, &hardB, &boostB, &cutB, &bothB, &aB, &bB, &nextB, &showB })
+        { addAndMakeVisible (*b); b->setClickingTogglesState (false); }
+        easyB.onClick = [this] { level = 0; newQuestion(); }; normB.onClick = [this] { level = 1; newQuestion(); }; hardB.onClick = [this] { level = 2; newQuestion(); };
+        boostB.onClick = [this] { mode = 0; newQuestion(); }; cutB.onClick = [this] { mode = 1; newQuestion(); }; bothB.onClick = [this] { mode = 2; newQuestion(); };
+        aB.onClick = [this] { playEq = false; ph.proc.setEarPlayEQ (false); refresh(); };
+        bB.onClick = [this] { playEq = true;  ph.proc.setEarPlayEQ (true);  refresh(); };
+        nextB.onClick = [this] { newQuestion(); };
+        showB.onClick = [this] { if (! answered) { answered = true; chosen = -1; ++total; streak = 0; refresh(); } };
+        setHelp (*this, "EAR TRAINING", "DAW の音に、隠れたベル EQ をかけて出題。B（EQ）と A（原音）を聴き比べて、持ち上がっている（または削られている）帯域を当てる。出題中は今の EQ 設定を一時的に外し、音量はそろえている。終了すると元に戻る",
+                 "A hidden bell is applied to the DAW signal. Compare B (EQ) and A (original) and pick the band that is boosted (or cut). Your EQ is bypassed while you play and levels are matched; leaving restores it");
+    }
+    void start() { newQuestion(); }
+    void stop() { ph.proc.setEar (false, {}); }
+    void refresh()
+    {
+        auto tog = [] (juce::TextButton& b, bool on) { b.setToggleState (on, juce::dontSendNotification); };
+        tog (easyB, level == 0); tog (normB, level == 1); tog (hardB, level == 2);
+        tog (boostB, mode == 0); tog (cutB, mode == 1); tog (bothB, mode == 2);
+        tog (aB, ! playEq); tog (bB, playEq);
+        easyB.setButtonText ("Easy"); normB.setButtonText ("Normal"); hardB.setButtonText ("Hard");
+        boostB.setButtonText ("Boost"); cutB.setButtonText ("Cut"); bothB.setButtonText ("Both");
+        aB.setButtonText (ph.tr ("A 原音", "A original")); bB.setButtonText (ph.tr ("B EQ", "B EQ"));
+        nextB.setButtonText (ph.tr ("次の問題", "Next")); showB.setButtonText (ph.tr ("答えを見る", "Show answer"));
+        showB.setVisible (! answered);
+        repaint();
+    }
+    void resized() override
+    {
+        const int lx = 12;
+        easyB.setBounds (lx + 54, 30, 56, 22); normB.setBounds (lx + 112, 30, 60, 22); hardB.setBounds (lx + 174, 30, 52, 22);
+        boostB.setBounds (lx + 54, 58, 56, 22); cutB.setBounds (lx + 112, 58, 60, 22); bothB.setBounds (lx + 174, 58, 52, 22);
+        const int qx = 280;
+        bB.setBounds (getWidth() - 96, 8, 84, 24); aB.setBounds (getWidth() - 184, 8, 84, 24);
+        nextB.setBounds (getWidth() - 96, getHeight() - 32, 84, 24);
+        showB.setBounds (getWidth() - 190, getHeight() - 32, 90, 24);
+        answerArea = { qx, 38, getWidth() - qx - 12, buttonsHeight() };
+    }
+    void paint (juce::Graphics& g) override
+    {
+        auto r = getLocalBounds().toFloat();
+        g.setColour (theme::lessonBg); g.fillRoundedRectangle (r, 6.0f);
+        g.setColour (theme::lessonLn); g.drawRoundedRectangle (r.reduced (0.5f), 6.0f, 1.0f);
+        g.setColour (theme::muted); g.setFont (theme::mono (10.0f, true));
+        g.drawText ("EAR TRAINING", 12, 8, 200, 14, juce::Justification::centredLeft);
+        g.setFont (theme::ui (11.0f));
+        g.drawText (ph.tr ("難易度", "Level"), 12, 30, 50, 22, juce::Justification::centredLeft);
+        g.drawText (ph.tr ("種類", "Type"), 12, 58, 50, 22, juce::Justification::centredLeft);
+        g.setColour (theme::text.withAlpha (0.82f)); g.setFont (theme::ui (10.0f));
+        static const char* lj[] = { "Easy：9 オクターブ帯、±9 dB・Q 1.4", "Normal：9 オクターブ帯、±6 dB・Q 2", "Hard：1/3 オクターブ帯、±3 dB・Q 4" };
+        static const char* le[] = { "Easy: 9 octave bands, ±9 dB, Q 1.4", "Normal: 9 octave bands, ±6 dB, Q 2", "Hard: 1/3-octave bands, ±3 dB, Q 4" };
+        g.drawFittedText (juce::String::fromUTF8 (ph.ja() ? lj[level] : le[level]), 12, 86, 250, 16, juce::Justification::centredLeft, 1, 0.9f);
+        g.setColour (theme::text); g.setFont (theme::mono (12.0f, true));
+        g.drawText ("SCORE " + juce::String (score) + " / " + juce::String (total) + "   STREAK " + juce::String (streak), 12, getHeight() - 30, 260, 18, juce::Justification::centredLeft);
+        g.setColour (theme::faint); g.setFont (theme::ui (9.5f));
+        g.drawFittedText (ph.tr ("出題中は今の EQ を外して聴かせる（終了で戻る）", "Your EQ is bypassed while playing (restored when you leave)"), 12, getHeight() - 50, 260, 16, juce::Justification::centredLeft, 1, 0.9f);
+
+        // question
+        g.setColour (theme::accent); g.setFont (theme::mono (10.0f, true));
+        g.drawText ("QUESTION " + juce::String (total + (answered ? 0 : 1)).paddedLeft ('0', 2), 280, 8, 110, 24, juce::Justification::centredLeft);
+        g.setColour (theme::text); g.setFont (theme::ui (13.0f, true));
+        const juce::String verb = q.g > 0 ? ph.tr ("持ち上がっている", "boosted") : ph.tr ("削られている", "cut");
+        g.drawText (ph.ja() ? juce::String::fromUTF8 ("どの帯域が ") + fmtDb (q.g, 0) + " dB " + verb + juce::String::fromUTF8 ("？")
+                            : "Which band is " + verb + " by " + fmtDb (std::abs (q.g), 0) + " dB?",
+                    390, 8, getWidth() - 390 - 190, 24, juce::Justification::centredLeft);
+        const auto& fs = freqs();
+        for (int i = 0; i < (int) fs.size(); ++i)
+        {
+            auto b = cellRect (i).toFloat();
+            juce::Colour bg = theme::panel, fg = theme::text, ln = theme::line;
+            if (answered && i == answer) { bg = theme::ok.withAlpha (0.19f); fg = theme::ok; ln = fg; }
+            else if (answered && i == chosen) { bg = theme::pre.withAlpha (0.15f); fg = theme::pre; ln = fg; }
+            else if (i == hover) bg = bg.brighter (0.1f);
+            g.setColour (bg); g.fillRoundedRectangle (b, 4.0f);
+            g.setColour (ln); g.drawRoundedRectangle (b.reduced (0.5f), 4.0f, 1.0f);
+            g.setColour (fg); g.setFont (theme::mono (level == 2 ? 10.0f : 12.0f, answered && i == answer));
+            g.drawText (fmtHz (fs[(size_t) i]), b, juce::Justification::centred);
+        }
+        if (answered)
+        {
+            const int ty = answerArea.getBottom() + 6;
+            g.setColour (theme::text); g.setFont (theme::ui (11.5f));
+            juce::String t;
+            if (chosen == answer) t = ph.tr ("正解！ ", "Correct! ");
+            else if (chosen >= 0) t = ph.tr ("正解は ", "It was ") + fmtHz (q.f) + " Hz. ";
+            else t = ph.tr ("正解は ", "It was ") + fmtHz (q.f) + " Hz. ";
+            t += describe (q.f);
+            if (chosen >= 0 && chosen != answer) t += "  /  " + fmtHz (freqs()[(size_t) chosen]) + ": " + describe (freqs()[(size_t) chosen]);
+            g.drawFittedText (t, 280, ty, getWidth() - 280 - 200, getHeight() - ty - 4, juce::Justification::topLeft, 3, 0.85f);
+        }
+    }
+    void mouseMove (const juce::MouseEvent& e) override { const int h = hit (e.getPosition()); if (h != hover) { hover = h; repaint(); } }
+    void mouseExit (const juce::MouseEvent&) override { hover = -1; repaint(); }
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        const int h = hit (e.getPosition());
+        if (h < 0 || answered) return;
+        chosen = h; answered = true; ++total;
+        if (h == answer) { ++score; ++streak; } else streak = 0;
+        refresh();
+    }
+private:
+    const std::vector<double>& freqs() const
+    {
+        static const std::vector<double> oct { 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000 };
+        static const std::vector<double> third { 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000 };
+        return level == 2 ? third : oct;
+    }
+    int buttonsHeight() const { return level == 2 ? 58 : 40; }
+    juce::Rectangle<int> cellRect (int i) const
+    {
+        const int n = (int) freqs().size(), perRow = level == 2 ? 13 : n, rows = level == 2 ? 2 : 1;
+        const int w = (answerArea.getWidth() - (perRow - 1) * 4) / perRow, h = (answerArea.getHeight() - (rows - 1) * 4) / rows;
+        return { answerArea.getX() + (i % perRow) * (w + 4), answerArea.getY() + (i / perRow) * (h + 4), w, h };
+    }
+    int hit (juce::Point<int> p) const { for (int i = 0; i < (int) freqs().size(); ++i) if (cellRect (i).contains (p)) return i; return -1; }
+    juce::String describe (double f) const
+    {
+        static const double c[] = { 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000 };
+        static const char* ja[] = { "重さ・床鳴り", "太さ・ボディ", "こもり・箱鳴り", "鼻声っぽさ・ホンキー", "前に出る・電話っぽさ", "硬さ・鼻にかかる", "輪郭・シャリッとした感じ", "歯擦音・きらめき", "空気感" };
+        static const char* en[] = { "weight, rumble", "body, warmth", "mud, boxiness", "nasal, honky", "forward, telephone-like", "hard, nasal edge", "definition, crunch", "sibilance, sparkle", "air" };
+        int best = 0; for (int i = 1; i < 9; ++i) if (std::abs (std::log2 (f / c[i])) < std::abs (std::log2 (f / c[best]))) best = i;
+        return juce::String::fromUTF8 (ph.ja() ? ja[best] : en[best]);
+    }
+    void newQuestion()
+    {
+        auto& rnd = juce::Random::getSystemRandom();
+        const auto& fs = freqs();
+        answer = rnd.nextInt ((int) fs.size());
+        const double gain = level == 0 ? 9.0 : level == 1 ? 6.0 : 3.0;
+        const bool cut = mode == 1 || (mode == 2 && rnd.nextBool());
+        q.f = (float) fs[(size_t) answer]; q.g = (float) (cut ? -gain : gain); q.q = level == 0 ? 1.4f : level == 1 ? 2.0f : 4.0f;
+        answered = false; chosen = -1; playEq = true;
+        ph.proc.setEar (true, q); ph.proc.setEarPlayEQ (true);
+        resized(); refresh();
+    }
+    ParamHelp& ph;
+    juce::TextButton easyB, normB, hardB, boostB, cutB, bothB, aB, bB, nextB, showB;
+    EQAnatomyProcessor::EarQuestion q;
+    int level = 1, mode = 0, answer = 0, chosen = -1, hover = -1, score = 0, total = 0, streak = 0; bool answered = false, playEq = true;
+    juce::Rectangle<int> answerArea;
+};

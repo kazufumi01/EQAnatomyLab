@@ -1,0 +1,244 @@
+#pragma once
+#include <juce_gui_basics/juce_gui_basics.h>
+#include <map>
+#include <vector>
+
+// =============================================================================
+//  Skins. Six looks, from the design canvas plus the current one:
+//    0 Studio        current: graphite, amber accent, yellow dotted phase
+//    1 Lab Light     A. Lab: light paper, teal accent (web lab look)
+//    2 Studio Night  B. Studio: deeper black, brighter amber, higher contrast
+//    3 Bridge        Meter A. Bridge: warm charcoal, cream VU-face graph
+//    4 Blueprint     Meter B. Lab: blue-grey paper, bronze accent
+//    5 Lesson Warm   B改 / A改: warm dark with the lesson card's amber
+//  The colours are variables so the whole editor can switch at run time.
+// =============================================================================
+namespace theme
+{
+inline juce::Colour bg, header, panel, well, line, grid, zero, text, muted, faint, accent, onAccent, pre, phase,
+                    lessonBg, lessonLn, sat, ok, side, analyzer, popup, live, splitWell, curve;
+inline bool lightPanels = false;
+inline int current = 0;
+inline std::array<juce::uint32, 6> bands { 0xff8f86e6, 0xff55b7c5, 0xff7cc66f, 0xffe48f5c, 0xffef7a6e, 0xffde8fbd };
+
+inline int numSkins() { return 10; }
+inline const char* skinName (int i)
+{
+    static const char* n[] = { "Studio", "Lab Light", "Studio Night", "Bridge", "Blueprint", "Lesson Warm",
+                               "Frame Graphite", "Frame Navy", "Bright Edge", "Frame Silver" };
+    return n[juce::jlimit (0, 9, i)];
+}
+
+inline void setSkin (int i)
+{
+    current = juce::jlimit (0, 9, i);
+    struct P { juce::uint32 bg, header, panel, well, line, grid, zero, text, muted, faint, accent, onAccent, pre, phase,
+               lessonBg, lessonLn, sat, ok, side, analyzer, popup, live, splitWell; bool light; std::array<juce::uint32, 6> b; };
+    static const std::array<juce::uint32, 6> darkBands { 0xff8f86e6, 0xff55b7c5, 0xff7cc66f, 0xffe48f5c, 0xffef7a6e, 0xffde8fbd };
+    static const std::array<juce::uint32, 6> inkBands  { 0xff6b5bb5, 0xff0d7385, 0xff3c8a3a, 0xffc47410, 0xffb83f36, 0xffa3487e };
+    static const P p[] = {
+        { 0xff121417, 0xff191c21, 0xff191c21, 0xff0d0f12, 0xff2a2e35, 0xff1d2126, 0xff353a42, 0xffe4e1da, 0xff8d929a, 0xff6c727b, 0xfff0b34a, 0xff1a1306, 0xffef7a6e, 0xffe9cf6a,
+          0xff1b1a16, 0xff5a4620, 0xffe8a33a, 0xff8fc779, 0xff6fc3d6, 0xff2a2e35, 0xff1c2026, 0xfffff1d6, 0xff0b0d10, false, darkBands },
+        { 0xfff6f7f9, 0xffe9edf1, 0xffffffff, 0xfffbfcfd, 0xffc8cfd7, 0xffe6e9ed, 0xffb9c1ca, 0xff16202b, 0xff566271, 0xff7a8592, 0xff0d6575, 0xffffffff, 0xffb83f36, 0xffa8861c,
+          0xfffbf3e8, 0xffe3c9a6, 0xffc47410, 0xff3c8a3a, 0xff2f7fb0, 0xffdfe4ea, 0xffffffff, 0xff16202b, 0xfff1f3f6, true, inkBands },
+        { 0xff0b0c0e, 0xff121418, 0xff15181c, 0xff07080a, 0xff23272e, 0xff15191e, 0xff2c3139, 0xffeceae4, 0xff8d929a, 0xff646a73, 0xffffbf47, 0xff1a1306, 0xffff7f70, 0xfff2d86a,
+          0xff16150f, 0xff4e3d1b, 0xffffaa3c, 0xff8fd27a, 0xff6fd0e6, 0xff20242b, 0xff121418, 0xfffff4dc, 0xff050607, false, darkBands },
+        { 0xff17181a, 0xff1e1f22, 0xff26272a, 0xffefe4c8, 0xff3a3b3f, 0xffdccfb2, 0xffb8ad98, 0xffe8e3d8, 0xff8f8a80, 0xff7d776c, 0xffe8a33a, 0xff1b1205, 0xffc0392b, 0xff8a6a12,
+          0xff26221a, 0xff5a4620, 0xffc4741a, 0xff4f8f5a, 0xff2f6f8a, 0xffe2d5b6, 0xff2a2621, 0xff2a2621, 0xffe6dabd, false, inkBands },
+        { 0xffe1e6eb, 0xffd3dae2, 0xffeef1f4, 0xfff6f7f9, 0xffb9c1ca, 0xffdfe3e8, 0xffa9b2bd, 0xff16202b, 0xff566271, 0xff7a8592, 0xff8a5a1c, 0xfffbf3e8, 0xffb83f36, 0xff0d6575,
+          0xfffbf3e8, 0xffe3c9a6, 0xffc47410, 0xff3c8a3a, 0xff0d6575, 0xffd5dce4, 0xffffffff, 0xff16202b, 0xffedf0f3, true, inkBands },
+        { 0xff15140f, 0xff1d1b15, 0xff1f1d17, 0xff100f0b, 0xff34302a, 0xff1e1c16, 0xff3d382f, 0xffece5d4, 0xff9a9282, 0xff746d60, 0xffe8a33a, 0xff1b1205, 0xffef7a6e, 0xffe9cf6a,
+          0xff241f14, 0xff6a5222, 0xffe8a33a, 0xff8fc779, 0xff7cc0c9, 0xff29261e, 0xff221f18, 0xfffff1d6, 0xff0c0b08, false, darkBands },
+        // 6 Frame Graphite: bright panels and header on a dark graphite gap, silver edge
+        { 0xff22252a, 0xffe9edf1, 0xffffffff, 0xfffbfcfd, 0xff9aa5b1, 0xffe6e9ed, 0xffb9c1ca, 0xff16202b, 0xff566271, 0xff7a8592, 0xff0d6575, 0xffffffff, 0xffb83f36, 0xffa8861c,
+          0xfffbf3e8, 0xffe3c9a6, 0xffc47410, 0xff3c8a3a, 0xff2f7fb0, 0xffdfe4ea, 0xffffffff, 0xff16202b, 0xfff1f3f6, true, inkBands },
+        // 7 Frame Navy: blue-grey paper panels on deep navy, bronze accent
+        { 0xff14202e, 0xffd3dae2, 0xffeef1f4, 0xfff6f7f9, 0xff8d9db0, 0xffdfe3e8, 0xffa9b2bd, 0xff16202b, 0xff566271, 0xff7a8592, 0xff8a5a1c, 0xfffbf3e8, 0xffb83f36, 0xff0d6575,
+          0xfffbf3e8, 0xffe3c9a6, 0xffc47410, 0xff3c8a3a, 0xff0d6575, 0xffd5dce4, 0xffffffff, 0xff16202b, 0xffedf0f3, true, inkBands },
+        // 8 Bright Edge: Studio Night panels, near-black gap, bright cream edge lines
+        { 0xff050607, 0xff121418, 0xff15181c, 0xff07080a, 0xffcfc8b4, 0xff15191e, 0xff2c3139, 0xffeceae4, 0xff8d929a, 0xff646a73, 0xffffbf47, 0xff1a1306, 0xffff7f70, 0xfff2d86a,
+          0xff16150f, 0xff4e3d1b, 0xffffaa3c, 0xff8fd27a, 0xff6fd0e6, 0xff20242b, 0xff121418, 0xfffff4dc, 0xff050607, false, darkBands },
+        // 9 Frame Silver: Frame Graphite inverted. Dark panels on a light silver gap
+        { 0xffd7dbe0, 0xff191c21, 0xff191c21, 0xff0d0f12, 0xff0a0b0d, 0xff1d2126, 0xff353a42, 0xffe4e1da, 0xff8d929a, 0xff6c727b, 0xfff0b34a, 0xff1a1306, 0xffef7a6e, 0xffe9cf6a,
+          0xff1b1a16, 0xff5a4620, 0xffe8a33a, 0xff8fc779, 0xff6fc3d6, 0xff2a2e35, 0xff1c2026, 0xfffff1d6, 0xff0b0d10, false, darkBands },
+    };
+    const auto& s = p[current];
+    auto C = [] (juce::uint32 v) { return juce::Colour (v); };
+    bg = C (s.bg); header = C (s.header); panel = C (s.panel); well = C (s.well); line = C (s.line); grid = C (s.grid); zero = C (s.zero);
+    text = C (s.text); muted = C (s.muted); faint = C (s.faint); accent = C (s.accent); onAccent = C (s.onAccent); pre = C (s.pre); phase = C (s.phase);
+    lessonBg = C (s.lessonBg); lessonLn = C (s.lessonLn); sat = C (s.sat); ok = C (s.ok); side = C (s.side); analyzer = C (s.analyzer);
+    popup = C (s.popup); live = C (s.live); splitWell = C (s.splitWell); lightPanels = s.light; bands = s.b;
+    curve = current == 3 ? juce::Colour (0xffb8620e) : accent;     // amber is too pale on the cream well
+}
+
+// =============================================================================
+//  Surface: only the gaps (the window background between panels, buttons and
+//  graphs). Independent of the skin, so 6 looks x 6 surfaces.
+//    0 Flat   1 Brushed Silver   2 Gunmetal   3 Dots   4 Carbon   5 Pinstripe
+//  Dots / Carbon / Pinstripe are drawn from the skin's own background colour.
+// =============================================================================
+inline int surface = 0;
+inline int numSurfaces() { return 6; }
+inline const char* surfaceName (int i)
+{
+    static const char* n[] = { "Flat", "Brushed Silver", "Gunmetal", "Dots", "Carbon", "Pinstripe" };
+    return n[juce::jlimit (0, 5, i)];
+}
+
+inline juce::Image surfaceTile (int kind, juce::Colour base)
+{
+    static std::map<std::pair<int, juce::uint32>, juce::Image> cache;
+    const auto key = std::make_pair (kind, base.getARGB());
+    if (auto it = cache.find (key); it != cache.end()) return it->second;
+
+    juce::Image img;
+    if (kind == 1 || kind == 2)                       // brushed metal: horizontal streaks, wraps in both directions
+    {
+        const int W = 256, H = 256; img = juce::Image (juce::Image::ARGB, W, H, true);
+        juce::Random rnd (kind * 7919);
+        const float c0 = kind == 1 ? 0.80f : 0.17f, amp = kind == 1 ? 0.060f : 0.030f;
+        for (int y = 0; y < H; ++y)
+        {
+            std::vector<float> row ((size_t) W);
+            const float rowBias = (rnd.nextFloat() - 0.5f) * amp * 1.4f;
+            for (auto& v : row) v = rnd.nextFloat() - 0.5f;
+            for (int pass = 0; pass < 3; ++pass)      // wrapped low-pass makes the streaks long
+                for (int x = 0; x < W; ++x) row[(size_t) x] = 0.5f * row[(size_t) x] + 0.25f * (row[(size_t) ((x + W - 1) % W)] + row[(size_t) ((x + 1) % W)]);
+            for (int x = 0; x < W; ++x)
+            {
+                const float v = juce::jlimit (0.0f, 1.0f, c0 + rowBias + row[(size_t) x] * amp * 5.0f);
+                img.setPixelAt (x, y, juce::Colour::fromFloatRGBA (v * 0.985f, v * 0.99f, v, 1.0f));
+            }
+        }
+    }
+    else if (kind == 3)                               // dot grid
+    {
+        const int N = 14; img = juce::Image (juce::Image::ARGB, N, N, true);
+        juce::Graphics g (img);
+        g.fillAll (base);
+        g.setColour (base.getPerceivedBrightness() > 0.5f ? juce::Colours::black.withAlpha (0.13f) : juce::Colours::white.withAlpha (0.09f));
+        g.fillEllipse (N * 0.5f - 1.1f, N * 0.5f - 1.1f, 2.2f, 2.2f);
+    }
+    else if (kind == 4)                               // carbon weave
+    {
+        const int N = 8; img = juce::Image (juce::Image::ARGB, N, N, true);
+        const bool light = base.getPerceivedBrightness() > 0.5f;
+        for (int y = 0; y < N; ++y)
+            for (int x = 0; x < N; ++x)
+            {
+                const bool horiz = ((x / 4) + (y / 4)) % 2 == 0;
+                const float t = (horiz ? (float) (x % 4) : (float) (y % 4)) / 3.0f;
+                img.setPixelAt (x, y, light ? base.darker (0.03f + 0.10f * t) : base.brighter (0.02f + 0.20f * t));
+            }
+    }
+    else                                              // pinstripe
+    {
+        img = juce::Image (juce::Image::ARGB, 6, 4, true);
+        const bool light = base.getPerceivedBrightness() > 0.5f;
+        for (int y = 0; y < 4; ++y)
+            for (int x = 0; x < 6; ++x)
+                img.setPixelAt (x, y, x == 0 ? (light ? base.darker (0.08f) : base.brighter (0.14f))
+                                              : x == 1 ? (light ? base.brighter (0.2f) : base.darker (0.25f)) : base);
+    }
+    cache[key] = img;
+    return img;
+}
+
+inline void paintSurface (juce::Graphics& g, juce::Rectangle<int> area)
+{
+    if (surface == 0) { g.setColour (bg); g.fillRect (area); return; }
+    // The finished background is rendered once per (surface, colour, size) and then only blitted,
+    // so animated children above it never pay for the texture again.
+    static juce::Image cached; static int kSurf = -1, kW = 0, kH = 0; static juce::uint32 kBg = 0;
+    if (! cached.isValid() || kSurf != surface || kW != area.getWidth() || kH != area.getHeight() || kBg != bg.getARGB())
+    {
+        cached = juce::Image (juce::Image::RGB, juce::jmax (1, area.getWidth()), juce::jmax (1, area.getHeight()), false);
+        juce::Graphics c (cached);
+        const auto r = cached.getBounds();
+        c.setTiledImageFill (surfaceTile (surface, bg), 0, 0, 1.0f);
+        c.fillRect (r);
+        if (surface <= 2)                             // a soft light fall-off so the metal does not look printed
+        {
+            c.setGradientFill (juce::ColourGradient (juce::Colours::white.withAlpha (surface == 1 ? 0.22f : 0.05f), 0.0f, 0.0f,
+                                                     juce::Colours::black.withAlpha (surface == 1 ? 0.14f : 0.22f), 0.0f, (float) r.getBottom(), false));
+            c.fillRect (r);
+        }
+        kSurf = surface; kW = area.getWidth(); kH = area.getHeight(); kBg = bg.getARGB();
+    }
+    g.drawImageAt (cached, area.getX(), area.getY());
+}
+
+// Text drawn on the graph well (which is cream in Bridge)
+inline juce::Colour onWell() { return well.getPerceivedBrightness() > 0.6f ? juce::Colour (0xff3a342a) : muted; }
+// A soft shade or highlight that works on light and dark panels
+inline juce::Colour shade (float a)  { return lightPanels ? juce::Colours::black.withAlpha (a * 0.25f) : juce::Colours::black.withAlpha (a); }
+inline juce::Colour hilite (float a) { return lightPanels ? juce::Colours::black.withAlpha (a * 0.6f) : juce::Colours::white.withAlpha (a); }
+
+inline juce::Colour bandColour (int i) { return juce::Colour (bands[(size_t) juce::jlimit (0, 5, i)]); }
+
+inline juce::Font ui (float size, bool bold = false)
+{
+   #if JUCE_MAC
+    return juce::Font (juce::FontOptions ("Hiragino Sans", size, bold ? juce::Font::bold : juce::Font::plain));
+   #else
+    return juce::Font (juce::FontOptions (size, bold ? juce::Font::bold : juce::Font::plain));
+   #endif
+}
+inline juce::Font mono (float size, bool bold = false)
+{
+   #if JUCE_MAC
+    return juce::Font (juce::FontOptions ("Menlo", size, bold ? juce::Font::bold : juce::Font::plain));
+   #else
+    return juce::Font (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(), size, bold ? juce::Font::bold : juce::Font::plain));
+   #endif
+}
+
+class LookAndFeel : public juce::LookAndFeel_V4
+{
+public:
+    LookAndFeel() { apply(); }
+    void apply()
+    {
+        setColour (juce::TextButton::buttonColourId, panel);
+        setColour (juce::TextButton::buttonOnColourId, accent);
+        setColour (juce::TextButton::textColourOffId, text);
+        setColour (juce::TextButton::textColourOnId, onAccent);
+        setColour (juce::ComboBox::backgroundColourId, lightPanels ? juce::Colours::white : panel.brighter (0.06f));
+        setColour (juce::ComboBox::outlineColourId, line);
+        setColour (juce::ComboBox::textColourId, text);
+        setColour (juce::ComboBox::arrowColourId, muted);
+        setColour (juce::PopupMenu::backgroundColourId, popup);
+        setColour (juce::PopupMenu::textColourId, text);
+        setColour (juce::PopupMenu::headerTextColourId, muted);
+        setColour (juce::PopupMenu::highlightedBackgroundColourId, accent);
+        setColour (juce::PopupMenu::highlightedTextColourId, onAccent);
+        setColour (juce::Label::textColourId, text);
+        setColour (juce::Label::textWhenEditingColourId, text);
+        setColour (juce::TextEditor::backgroundColourId, well);
+        setColour (juce::TextEditor::textColourId, lightPanels || well.getPerceivedBrightness() > 0.6f ? juce::Colour (0xff16202b) : text);
+        setColour (juce::TextEditor::highlightColourId, accent.withAlpha (0.4f));
+        setColour (juce::CaretComponent::caretColourId, accent);
+        setColour (juce::Slider::backgroundColourId, shade (0.4f));
+    }
+    void drawButtonBackground (juce::Graphics& g, juce::Button& b, const juce::Colour&, bool over, bool down) override
+    {
+        auto r = b.getLocalBounds().toFloat().reduced (0.5f);
+        const bool on = b.getToggleState();
+        auto col = b.findColour (on ? juce::TextButton::buttonOnColourId : juce::TextButton::buttonColourId);
+        if (! on && (over || down)) col = lightPanels ? col.darker (0.06f) : col.brighter (0.12f);
+        g.setColour (col); g.fillRoundedRectangle (r, 4.0f);
+        if (! on) { g.setColour (b.findColour (juce::ComboBox::outlineColourId)); g.drawRoundedRectangle (r, 4.0f, 1.0f); }
+    }
+    juce::Font getTextButtonFont (juce::TextButton& b, int h) override
+    {
+        const float px = (float) (double) b.getProperties().getWithDefault ("fontPx", 12.0);   // a button may ask for a smaller font
+        return ui (juce::jmin (px, h * 0.5f));
+    }
+    juce::Font getComboBoxFont (juce::ComboBox&) override { return ui (11.5f); }
+    juce::Font getPopupMenuFont() override { return ui (13.0f); }
+    juce::Font getLabelFont (juce::Label& l) override { return l.getFont(); }
+};
+
+// make sure the variables hold the default skin before anything paints
+inline const bool initialised = [] { setSkin (0); return true; }();
+}
