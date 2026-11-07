@@ -1,12 +1,12 @@
 # EQ Anatomy Lab（JUCE プラグイン）
 
-by Johan Plus Kei — EQ の中身を「見て・聴いて・触って」学べる無料プラグイン（AU / VST3 / Standalone）
+by Johan Plus Kei — EQ の中身を「見て・聴いて・触って」学べる VST・AU 対応プラグイン（VST3 / AU / Standalone）
 
 ![EQ Anatomy Lab](docs/screenshot-main.png)
 
 ## ⬇️ ダウンロード（ベータ版）/ Download (Beta)
 
-**[最新版をダウンロード / Download latest](https://github.com/kazufumi01/EQAnatomyLab/releases/latest)** — 無料 / Free
+**[最新版をダウンロード / Download latest](https://github.com/kazufumi01/EQAnatomyLab/releases/latest)** — 期間限定ベータ版無料配布中 / Free beta for a limited time
 
 | | 手動インストール（おすすめ） | インストーラー |
 |---|---|---|
@@ -57,3 +57,7 @@ cmake --build build --config Release -j
 
 JUCE は **Starter ライセンス** で使用。配布物はフリーウェア使用許諾（`packaging/mac/resources/license.txt`）に従います。
 ソースは学習目的で公開していますが、無断での再配布・販売はできません。
+
+---
+
+**Johan Plus Kei** — [Spotify](https://open.spotify.com/artist/30PV2gqUbDDwvuWtKaok0x) ・ [Apple Music](https://music.apple.com/us/artist/johan-plus-kei/519360150) ・ [X](https://x.com/johanpluskei) ・ [Instagram](https://www.instagram.com/johanpluskei) ・ [Learning labs](https://kazufumi01.github.io/)
