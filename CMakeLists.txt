@@ -3,6 +3,9 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "")
 if(APPLE)
   set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "")
 endif()
+# Windows: C++ ランタイムを静的リンク（VC++ 再頒布パッケージ不要）
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 project(EQAnatomy VERSION 0.1.0)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,7 +30,7 @@ endif()
 if(APPLE)
   set(EQA_FORMATS AU VST3 Standalone)
 else()
-  set(EQA_FORMATS VST3)
+  set(EQA_FORMATS VST3 Standalone)
 endif()
 
 juce_add_plugin(EQAnatomy
@@ -45,6 +48,9 @@ juce_add_plugin(EQAnatomy
   COPY_PLUGIN_AFTER_BUILD ${EQA_COPY_AFTER_BUILD})
 
 target_sources(EQAnatomy PRIVATE Source/PluginProcessor.cpp Source/PluginEditor.cpp)
+if(MSVC)
+  target_compile_options(EQAnatomy PRIVATE /utf-8)   # 日本語文字列のため
+endif()
 target_compile_definitions(EQAnatomy PUBLIC
   JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0 JUCE_DISPLAY_SPLASH_SCREEN=0)
 target_link_libraries(EQAnatomy PRIVATE juce::juce_audio_utils juce::juce_dsp
