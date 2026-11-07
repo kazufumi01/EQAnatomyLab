@@ -11,10 +11,11 @@ by Johan Plus Kei — EQ の中身を「見て・聴いて・触って」学べ�
 | | 手動インストール（おすすめ） | インストーラー |
 |---|---|---|
 | **Mac**（macOS 11+, Apple Silicon / Intel） | `EQAnatomyLab-x.x.x-mac.zip` | `EQAnatomyLab-x.x.x-mac.pkg` |
+| **Windows**（10 / 11, 64bit）⚠️未検証 | `EQAnatomyLab-x.x.x-win64.zip` | `EQAnatomyLab-x.x.x-win64.exe` |
 
 - インストール方法：**[INSTALL.md](INSTALL.md)**（日本語 / English）
-- Windows 版は未対応です（Mac のみ）。
-- Apple の公証をしていないため、初回のみ警告が出ます（回避手順は INSTALL.md）。
+- ⚠️ **Windows 版は実機での動作確認ができていません**（自動ビルドで作成。VST3 と Standalone）。 / The Windows build is untested on real hardware.
+- Apple の公証・Windows のコード署名をしていないため、初回のみ警告が出ます。
 - 不具合・要望は [Issues](https://github.com/kazufumi01/EQAnatomyLab/issues) へ。
 
 ---
@@ -35,7 +36,7 @@ by Johan Plus Kei — EQ の中身を「見て・聴いて・触って」学べ�
 
 ---
 
-## ビルド（macOS）
+## ビルド
 
 ```bash
 ./build.sh            # 手元の JUCE を使う（build.sh 内の JUCE_PATH を編集）
@@ -49,7 +50,8 @@ cmake --build build --config Release -j
 ```
 
 - 配布ビルドでは `-DEQA_COPY_AFTER_BUILD=OFF`（ビルド後のコピーを無効化）
-- インストーラー作成：`packaging/mac/build_pkg.sh <version>` ／ `packaging/mac/build_zip.sh <version>`（出力は `dist/`）
+- Mac のインストーラー作成：`packaging/mac/build_pkg.sh <version>` ／ `packaging/mac/build_zip.sh <version>`（出力は `dist/`）
+- Windows は GitHub Actions（`.github/workflows/build-win.yml`、手動実行）で VST3 / Standalone をビルドし、Inno Setup でインストーラーを作成
 
 ## ライセンス
 
