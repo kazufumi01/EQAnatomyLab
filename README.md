@@ -61,3 +61,9 @@ JUCE は **Starter ライセンス** で使用。配布物はフリーウェア�
 ---
 
 **Johan Plus Kei** — [Spotify](https://open.spotify.com/artist/30PV2gqUbDDwvuWtKaok0x) ・ [Apple Music](https://music.apple.com/us/artist/johan-plus-kei/519360150) ・ [X](https://x.com/johanpluskei) ・ [Instagram](https://www.instagram.com/johanpluskei) ・ [Learning labs](https://kazufumi01.github.io/)
+
+---
+
+**© 2026 Johan Plus Kei. All rights reserved.**
+プラグイン・ソースコード・画像・文章の著作権その他の権利は Johan Plus Kei に帰属します。プラグインは無料で使えますが、ソースは学習のために公開しているもので、無断での転用・再配布・販売はできません。JUCE（Starter ライセンス）と VST3 SDK を使用しています。VST は Steinberg Media Technologies GmbH の登録商標です。
+The copyright and all other rights in the plug-in, source code, images and text belong to Johan Plus Kei. The plug-in is free to use; the source is published for learning only and may not be reused, redistributed or sold without permission. Built with JUCE (Starter licence) and the VST3 SDK. VST is a registered trademark of Steinberg Media Technologies GmbH.
